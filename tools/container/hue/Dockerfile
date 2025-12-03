@@ -33,8 +33,15 @@ RUN yum install -y microdnf && \
 COPY --chown=${HUEUSER}:${HUEUSER} ${HUEUSER} ${HUE_HOME}
 COPY --chown=${HUEUSER}:${HUEUSER} hue.sh ${HUE_HOME}/hue.sh
 
-# Install psycopg2-binary
-RUN $HUE_BIN/python3.8 -m pip install --upgrade pip --force && $HUE_BIN/pip install psycopg2-binary
+# Install psycopg2
+RUN set -eux; \
+    apk --no-cache add \
+    gcc \
+    python3-dev \
+    build-base \
+    postgresql-dev && \
+    $HUE_BIN/python3.8 -m pip install --upgrade pip --force && \
+    $HUE_BIN/pip install psycopg2 --no-cache-dir
 
 # Setup directory structure
 RUN mkdir -p ${HUE_LOG_DIR} && chown -R ${HUEUSER}:${HUEUSER} ${HUE_LOG_DIR}
@@ -55,7 +62,6 @@ RUN mkdir -p /etc/supervisor.d/ && chmod +w /etc/supervisor.d && mkdir -p /var/l
 ADD supervisor-files/etc/supervisord.conf /etc/supervisord.conf
 ADD supervisor-files/hue_server.conf /etc/supervisor.d/
 ADD supervisor-files/hue_ktrenewer.conf /etc/supervisor.d/
-ADD supervisor-files/hue_loglistener.conf /etc/supervisor.d/
 ADD supervisor-files/hue_celery.conf /etc/supervisor.d/
 ADD supervisor-files/hue_redis.conf /etc/supervisor.d/
 RUN chown -R ${HUEUSER}:${HUEUSER} /etc/supervisord.conf && chown -R ${HUEUSER}:${HUEUSER} /etc/supervisor.d

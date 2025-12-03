@@ -15,17 +15,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import absolute_import
-
-import os
-import sys
-import json
-import uuid
-import logging
 import calendar
+import json
+import logging
+import os
+import uuid
 from builtins import next, object
 from collections import OrderedDict
 from itertools import chain
+from urllib.parse import quote as urllib_quote
 
 from django.contrib.auth.validators import UnicodeUsernameValidator
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
@@ -35,53 +33,42 @@ from django.db import connection, models, transaction
 from django.db.models import Q
 from django.db.models.query import QuerySet
 from django.urls import NoReverseMatch, reverse
+from django.utils.translation import gettext as _, gettext_lazy as _t
 
-from dashboard.conf import HAS_REPORT_ENABLED, IS_ENABLED as DASHBOARD_ENABLED, get_engines
+from dashboard.conf import get_engines, HAS_REPORT_ENABLED, IS_ENABLED as DASHBOARD_ENABLED
 from desktop import appmanager
 from desktop.auth.backend import is_admin
 from desktop.conf import (
   APP_BLACKLIST,
-  COLLECT_USAGE,
   DISABLE_SOURCE_AUTOCOMPLETE,
-  ENABLE_CONNECTORS,
+  ENABLE_NEW_IMPORTER,
+  ENABLE_NEW_STORAGE_BROWSER,
   ENABLE_ORGANIZATIONS,
-  ENABLE_PROMETHEUS,
-  ENABLE_SHARING,
   ENABLE_UNIFIED_ANALYTICS,
+  get_clusters,
+  has_connectors,
   HUE_HOST_NAME,
   HUE_IMAGE_VERSION,
   IS_MULTICLUSTER_ONLY,
   RAZ,
   TASK_SERVER,
-  get_clusters,
-  has_connectors,
+  USE_STORAGE_CONNECTORS,
 )
 from desktop.lib import fsmanager
 from desktop.lib.connectors.api import _get_installed_connectors
 from desktop.lib.connectors.models import Connector
 from desktop.lib.exceptions_renderable import PopupException
 from desktop.lib.i18n import force_unicode
-from desktop.lib.paths import SAFE_CHARACTERS_URI_COMPONENTS, get_run_root
+from desktop.lib.paths import get_run_root, SAFE_CHARACTERS_URI_COMPONENTS
 from desktop.redaction import global_redaction_engine
 from desktop.settings import DOCUMENT2_SEARCH_MAX_LENGTH, HUE_DESKTOP_VERSION
 from filebrowser.conf import REMOTE_STORAGE_HOME
-from hadoop.core_site import get_raz_api_url, get_raz_s3_default_bucket
 from indexer.conf import ENABLE_DIRECT_UPLOAD
 from kafka.conf import has_kafka
 from metadata.conf import get_optimizer_mode
-from notebook.conf import DEFAULT_INTERPRETER, DEFAULT_LIMIT, SHOW_NOTEBOOKS, get_ordered_interpreters
-from useradmin.models import Group, User, get_organization
+from notebook.conf import DEFAULT_INTERPRETER, DEFAULT_LIMIT, get_ordered_interpreters, SHOW_NOTEBOOKS
+from useradmin.models import get_organization, Group, User
 from useradmin.organization import _fitered_queryset
-
-if sys.version_info[0] > 2:
-  from urllib.parse import quote as urllib_quote
-
-  from django.utils.translation import gettext as _, gettext_lazy as _t
-else:
-  from urllib import quote as urllib_quote
-
-  from django.utils.translation import ugettext as _, ugettext_lazy as _t
-
 
 LOG = logging.getLogger()
 
@@ -493,7 +480,7 @@ class DocumentManager(models.Manager):
               if not job.managed:
                 doc.extra = 'jobsub'
                 doc.save()
-    except Exception as e:
+    except Exception:
       LOG.exception('error syncing oozie')
 
     try:
@@ -505,7 +492,7 @@ class DocumentManager(models.Manager):
             doc = Document.objects.link(job, owner=job.owner, name=job.name, description=job.desc, extra=job.type)
             if job.is_trashed:
               doc.send_to_trash()
-    except Exception as e:
+    except Exception:
       LOG.exception('error syncing beeswax')
 
     try:
@@ -515,7 +502,7 @@ class DocumentManager(models.Manager):
         with transaction.atomic():
           for job in find_jobs_with_no_doc(PigScript):
             Document.objects.link(job, owner=job.owner, name=job.dict['name'], description='')
-    except Exception as e:
+    except Exception:
       LOG.exception('error syncing pig')
 
     try:
@@ -540,7 +527,7 @@ class DocumentManager(models.Manager):
                 Document.objects.link(dashboard_doc, owner=owner, name=dashboard.label, description=dashboard.label,
                                       extra='search-dashboard')
                 dashboard.save()
-    except Exception as e:
+    except Exception:
       LOG.exception('error syncing search')
 
     try:
@@ -560,7 +547,7 @@ class DocumentManager(models.Manager):
             else:
               extra = ''
             doc = Document.objects.link(job, owner=job.owner, name=job.name, description=job.description, extra=extra)
-    except Exception as e:
+    except Exception:
       LOG.exception('error syncing Document2')
 
     if not doc2_only and Document._meta.db_table in table_names:
@@ -569,7 +556,7 @@ class DocumentManager(models.Manager):
         for doc in Document.objects.filter(tags=None):
           default_tag = DocumentTag.objects.get_default_tag(doc.owner)
           doc.tags.add(default_tag)
-      except Exception as e:
+      except Exception:
         LOG.exception('error adding at least one tag to docs')
 
       # Make sure all the sample user documents are shared.
@@ -584,7 +571,7 @@ class DocumentManager(models.Manager):
 
             doc.save()
             Document.objects.filter(id=doc.id).update(last_modified=doc_last_modified)
-      except Exception as e:
+      except Exception:
         LOG.exception('error sharing sample user documents')
 
       # For now remove the default tag from the examples
@@ -592,7 +579,7 @@ class DocumentManager(models.Manager):
         for doc in Document.objects.filter(tags__tag=DocumentTag.EXAMPLE):
           default_tag = DocumentTag.objects.get_default_tag(doc.owner)
           doc.tags.remove(default_tag)
-      except Exception as e:
+      except Exception:
         LOG.exception('error removing default tags')
 
       # ------------------------------------------------------------------------
@@ -1815,10 +1802,6 @@ class ClusterConfig(object):
       'default_sql_interpreter': default_sql_interpreter,
       'cluster_type': self.cluster_type,
       'has_computes': self.cluster_type in ('cdw', 'altus', 'snowball'),  # or any grouped engine connectors
-      'hue_config': {
-        'enable_sharing': ENABLE_SHARING.get(),
-        'collect_usage': COLLECT_USAGE.get()
-      },
       'vw_name': hue_host_name,
       'img_version': img_version,
       'hue_version': version_of_hue
@@ -2021,74 +2004,88 @@ class ClusterConfig(object):
 
     remote_home_storage = get_remote_home_storage(self.user)
 
-    for hdfs_connector in hdfs_connectors:
-      force_home = remote_home_storage and not remote_home_storage.startswith('/')
-      home_path = self.user.get_home_directory(force_home=force_home)
+    if ENABLE_NEW_STORAGE_BROWSER.get():
       interpreters.append({
-        'type': 'hdfs',
-        'displayName': hdfs_connector,
-        'buttonName': _('Browse'),
-        'tooltip': hdfs_connector,
-        'page': '/filebrowser/' + (
-          not self.user.is_anonymous and
-          'view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS) or ''
-        )
+        'type': 'storagebrowser',
+        'displayName': _('Storage Browser'),
+        'buttonName': _('Storage Browser'),
+        'tooltip': _('Storage Browser'),
+        'page': '/storagebrowser'
       })
+    else:
+      for hdfs_connector in hdfs_connectors:
+        force_home = remote_home_storage and not remote_home_storage.startswith('/')
+        home_path = self.user.get_home_directory(force_home=force_home)
+        interpreters.append({
+          'type': 'hdfs',
+          'displayName': hdfs_connector,
+          'buttonName': _('Browse'),
+          'tooltip': hdfs_connector,
+          'page': '/filebrowser/' + (
+            not self.user.is_anonymous and
+            'view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS) or ''
+          )
+        })
 
-    if 'filebrowser' in self.apps and fsmanager.is_enabled_and_has_access('s3a', self.user):
-      from aws.s3.s3fs import get_s3_home_directory
-      home_path = get_s3_home_directory(self.user)
-      interpreters.append({
-        'type': 's3',
-        'displayName': _('S3'),
-        'buttonName': _('Browse'),
-        'tooltip': _('S3'),
-        'page': '/filebrowser/view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS)
-      })
+      if 'filebrowser' in self.apps and fsmanager.is_enabled_and_has_access('s3a', self.user):
+        if USE_STORAGE_CONNECTORS.get():
+          from desktop.lib.fs.s3.conf_utils import get_s3_home_directory
+        else:
+          from aws.s3.s3fs import get_s3_home_directory
 
-    if 'filebrowser' in self.apps and fsmanager.is_enabled_and_has_access('gs', self.user):
-      from desktop.lib.fs.gc.gs import get_gs_home_directory
-      home_path = get_gs_home_directory(self.user)
-      interpreters.append({
-        'type': 'gs',
-        'displayName': _('GS'),
-        'buttonName': _('Browse'),
-        'tooltip': _('Google Storage'),
-        'page': '/filebrowser/view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS)
-      })
+        home_path = get_s3_home_directory(self.user)
 
-    if 'filebrowser' in self.apps and fsmanager.is_enabled_and_has_access('adl', self.user):
-      # ADLS does not have a dedicated get_home_directory method
-      home_path = remote_home_storage if remote_home_storage else 'adl:/'
-      interpreters.append({
-        'type': 'adls',
-        'displayName': _('ADLS'),
-        'buttonName': _('Browse'),
-        'tooltip': _('ADLS'),
-        'page': '/filebrowser/view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS)
-      })
+        interpreters.append({
+          'type': 's3',
+          'displayName': _('S3'),
+          'buttonName': _('Browse'),
+          'tooltip': _('S3'),
+          'page': '/filebrowser/view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS)
+        })
 
-    if 'filebrowser' in self.apps and fsmanager.is_enabled_and_has_access('abfs', self.user):
-      from azure.abfs.__init__ import get_abfs_home_directory
-      home_path = get_abfs_home_directory(self.user)
-      interpreters.append({
-        'type': 'abfs',
-        'displayName': _('ABFS'),
-        'buttonName': _('Browse'),
-        'tooltip': _('ABFS'),
-        'page': '/filebrowser/view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS)
-      })
+      if 'filebrowser' in self.apps and fsmanager.is_enabled_and_has_access('gs', self.user):
+        from desktop.lib.fs.gc.gs import get_gs_home_directory
+        home_path = get_gs_home_directory(self.user)
+        interpreters.append({
+          'type': 'gs',
+          'displayName': _('GS'),
+          'buttonName': _('Browse'),
+          'tooltip': _('Google Storage'),
+          'page': '/filebrowser/view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS)
+        })
 
-    if 'filebrowser' in self.apps and fsmanager.is_enabled_and_has_access('ofs', self.user):
-      from desktop.lib.fs.ozone.ofs import get_ofs_home_directory
-      home_path = get_ofs_home_directory()
-      interpreters.append({
-        'type': 'ofs',
-        'displayName': _('Ozone'),
-        'buttonName': _('Browse'),
-        'tooltip': _('Ozone'),
-        'page': '/filebrowser/view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS)
-      })
+      if 'filebrowser' in self.apps and fsmanager.is_enabled_and_has_access('adl', self.user):
+        # ADLS does not have a dedicated get_home_directory method
+        home_path = remote_home_storage if remote_home_storage else 'adl:/'
+        interpreters.append({
+          'type': 'adls',
+          'displayName': _('ADLS'),
+          'buttonName': _('Browse'),
+          'tooltip': _('ADLS'),
+          'page': '/filebrowser/view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS)
+        })
+
+      if 'filebrowser' in self.apps and fsmanager.is_enabled_and_has_access('abfs', self.user):
+        from azure.abfs.__init__ import get_abfs_home_directory
+        home_path = get_abfs_home_directory(self.user)
+        interpreters.append({
+          'type': 'abfs',
+          'displayName': _('ABFS'),
+          'buttonName': _('Browse'),
+          'tooltip': _('ABFS'),
+          'page': '/filebrowser/view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS)
+        })
+
+      if 'filebrowser' in self.apps and fsmanager.is_enabled_and_has_access('ofs', self.user):
+        from desktop.lib.fs.ozone.ofs import get_ofs_home_directory
+        home_path = get_ofs_home_directory()
+        interpreters.append({
+          'type': 'ofs',
+          'displayName': _('Ozone'),
+          'buttonName': _('Browse'),
+          'tooltip': _('Ozone'),
+          'page': '/filebrowser/view=' + urllib_quote(home_path, safe=SAFE_CHARACTERS_URI_COMPONENTS)
+        })
 
     if 'metastore' in self.apps:
       interpreters.append({
@@ -2154,13 +2151,22 @@ class ClusterConfig(object):
         ENABLE_DIRECT_UPLOAD.get()
         ) \
         and 'importer' not in APP_BLACKLIST.get():
-      interpreters.append({
-        'type': 'importer',
-        'displayName': _('Importer'),
-        'buttonName': _('Import'),
-        'tooltip': _('Importer'),
-        'page': '/indexer/importer'
-      })
+        if ENABLE_NEW_IMPORTER.get():
+          interpreters.append({
+            'type': 'newimporter',
+            'displayName': _('New Importer'),
+            'buttonName': _('Import'),
+            'tooltip': _('New Importer'),
+            'page': '/newimporter'
+          })
+
+        interpreters.append({
+          'type': 'importer',
+          'displayName': _('Importer'),
+          'buttonName': _('Import'),
+          'tooltip': _('Importer'),
+          'page': '/indexer/importer'
+        })
 
     if 'sqoop' in self.apps:
       from sqoop.conf import IS_ENABLED

@@ -19,15 +19,17 @@ from urllib.parse import urlparse as lib_urlparse
 
 from crequest.middleware import CrequestMiddleware
 
-from aws.conf import is_raz_s3
-from aws.s3.s3fs import get_s3_home_directory
 from azure.abfs.__init__ import get_abfs_home_directory
 from azure.conf import is_raz_abfs
 from desktop.auth.backend import is_admin
-from desktop.conf import DEFAULT_USER, ENABLE_ORGANIZATIONS, is_ofs_enabled, is_raz_gs
+from desktop.conf import DEFAULT_USER, is_ofs_enabled, is_raz_gs, USE_STORAGE_CONNECTORS
 from desktop.lib.fs.gc.gs import get_gs_home_directory
-from desktop.lib.fs.ozone import OFS_ROOT
 from useradmin.models import User
+
+if USE_STORAGE_CONNECTORS.get():
+  from desktop.lib.fs.s3.conf_utils import is_raz_s3
+else:
+  from aws.conf import is_raz_s3
 
 LOG = logging.getLogger()
 DEFAULT_USER = DEFAULT_USER.get()
@@ -221,6 +223,11 @@ class ProxyFS(object):
 
     # Get the new home_path for S3/ABFS/GS when RAZ is enabled.
     if is_raz_s3():
+      if USE_STORAGE_CONNECTORS.get():
+        from desktop.lib.fs.s3.conf_utils import get_s3_home_directory
+      else:
+        from aws.s3.s3fs import get_s3_home_directory
+
       home_path = get_s3_home_directory(User.objects.get(username=self.getuser()))
     elif is_raz_abfs():
       home_path = get_abfs_home_directory(User.objects.get(username=self.getuser()))
@@ -297,6 +304,7 @@ class ProxyFS(object):
   def _rename_star_between_filesystems(self, old, new):
     raise NotImplementedError("Will be addressed in HUE-2934")
 
+  # Deprecated
   def upload(self, file, path, *args, **kwargs):
     self._get_fs(path).upload(file, path, *args, **kwargs)
 
@@ -308,3 +316,6 @@ class ProxyFS(object):
 
   def get_upload_chuck_size(self, path):
     return self._get_fs(path).get_upload_chuck_size()
+
+  def get_upload_handler(self, destination_path, overwrite):
+    return self._get_fs(destination_path).get_upload_handler(destination_path, overwrite)

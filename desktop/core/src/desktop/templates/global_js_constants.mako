@@ -16,7 +16,7 @@
 
 <%!
   import sys
-
+  import json
   from desktop import conf
   from desktop.auth.backend import is_admin, is_hue_admin
   from desktop.conf import APP_SWITCHER_ALTUS_BASE_URL, APP_SWITCHER_MOW_BASE_URL, CUSTOM_DASHBOARD_URL, \
@@ -32,7 +32,9 @@
   from jobbrowser.conf import ENABLE_HISTORY_V2, ENABLE_QUERY_BROWSER, ENABLE_HIVE_QUERY_BROWSER, MAX_JOB_FETCH, \
       QUERY_STORE
   from filebrowser.conf import SHOW_UPLOAD_BUTTON, REMOTE_STORAGE_HOME, MAX_FILE_SIZE_UPLOAD_LIMIT
-  from indexer.conf import ENABLE_NEW_INDEXER
+  from filebrowser.views import MAX_FILEEDITOR_SIZE
+  from indexer.conf import ENABLE_NEW_INDEXER, ENABLE_DIRECT_UPLOAD, ENABLE_SQOOP, ENABLE_KAFKA, ENABLE_ALTUS, \
+  ENABLE_ENVELOPE, ENABLE_FIELD_EDITOR, CONFIG_INDEXER_LIBS_PATH
   from libsaml.conf import get_logout_redirect_url, CDP_LOGOUT_URL
   from metadata.conf import has_catalog, has_readonly_catalog, has_optimizer, has_workload_analytics, OPTIMIZER, get_optimizer_url, \
       get_catalog_url, get_optimizer_mode
@@ -145,6 +147,9 @@
 
   window.SAML_LOGOUT_URL = '${ CDP_LOGOUT_URL.get() }';
   window.SAML_REDIRECT_URL = '${ get_logout_redirect_url() }';
+
+  window.ALLOW_HUE_LOGOUT = window.KNOX_BASE_URL === '';
+
   window.SKIP_CACHE = [
     'home', 'oozie_workflow', 'oozie_coordinator', 'oozie_bundle', 'dashboard', 'metastore', 'filebrowser',
     'useradmin_users', 'useradmin_groups', 'useradmin_newgroup', 'useradmin_editgroup',
@@ -179,11 +184,18 @@
   window.ENABLE_NEW_CREATE_TABLE = '${ hasattr(ENABLE_NEW_CREATE_TABLE, 'get') and ENABLE_NEW_CREATE_TABLE.get()}' === 'True';
   window.ENABLE_HUE_5 = '${ ENABLE_HUE_5.get() }' === 'True';
   window.ENABLE_PREDICT = '${ OPTIMIZER.ENABLE_PREDICT.get() }' === 'True';
-  window.ENABLE_SQL_INDEXER = '${ ENABLE_SQL_INDEXER.get() }' === 'True';
-
   window.ENABLE_QUERY_BUILDER = '${ ENABLE_QUERY_BUILDER.get() }' === 'True';
   window.ENABLE_QUERY_SCHEDULING = '${ ENABLE_QUERY_SCHEDULING.get() }' === 'True';
   window.ENABLE_UNIFIED_ANALYTICS = '${ ENABLE_UNIFIED_ANALYTICS.get() }' === 'True';
+  window.ENABLE_DIRECT_UPLOAD = '${ hasattr(ENABLE_DIRECT_UPLOAD, 'get') and ENABLE_DIRECT_UPLOAD.get() }' === 'True';
+  window.ENABLE_SQOOP = '${ hasattr(ENABLE_SQOOP, 'get') and ENABLE_SQOOP.get() }' === 'True';
+  window.ENABLE_KAFKA = '${ hasattr(ENABLE_KAFKA, 'get') and ENABLE_KAFKA.get() }' === 'True';
+  window.ENABLE_ALTUS = '${ hasattr(ENABLE_ALTUS, 'get') and ENABLE_ALTUS.get() }' === 'True';
+  window.ENABLE_FIELD_EDITOR = '${ hasattr(ENABLE_FIELD_EDITOR, 'get') and ENABLE_FIELD_EDITOR.get() }' === 'True';
+  window.CONFIG_INDEXER_LIBS_PATH = '${ CONFIG_INDEXER_LIBS_PATH.get() if hasattr(CONFIG_INDEXER_LIBS_PATH, 'get') else ''}';
+  window.ENABLE_SQL_INDEXER = '${ ENABLE_SQL_INDEXER.get() }' === 'True';
+  window.ENABLE_ENVELOPE = '${ hasattr(ENABLE_ENVELOPE, 'get') and ENABLE_ENVELOPE.get() }' === 'True';
+  window.REQUEST_FS = '${hasattr(request, "fs")}' === 'True';
   window.RAZ_IS_ENABLED = '${ RAZ.IS_ENABLED.get() }' === 'True';
 
   window.ENABLE_HISTORY_V2 = '${ hasattr(ENABLE_HISTORY_V2, 'get') and ENABLE_HISTORY_V2.get() }' === 'True';
@@ -210,6 +222,7 @@
 
   window.SHOW_NOTEBOOKS = '${ SHOW_NOTEBOOKS.get() }' === 'True'
   window.SHOW_UPLOAD_BUTTON = '${ hasattr(SHOW_UPLOAD_BUTTON, 'get') and SHOW_UPLOAD_BUTTON.get() }' === 'True'
+  window.MAX_FILEEDITOR_SIZE = ${ MAX_FILEEDITOR_SIZE };
 
   window.UPLOAD_CHUNK_SIZE = ${ UPLOAD_CHUNK_SIZE.get() };
   window.MAX_FILE_SIZE_UPLOAD_LIMIT = ${ MAX_FILE_SIZE_UPLOAD_LIMIT.get() if hasattr(MAX_FILE_SIZE_UPLOAD_LIMIT, 'get') and MAX_FILE_SIZE_UPLOAD_LIMIT.get() >= 0 else 'undefined' };
@@ -254,7 +267,6 @@
     'A new top bar!': '${ _('A new top bar!') }',
     'Active cluster': '${ _('Active cluster') }',
     'Active compute': '${ _('Active compute') }',
-    'Active database': '${ _('Active database') }',
     'Active namespace': '${ _('Active namespace') }',
     'Add a description...': '${ _('Add a description...') }',
     'Add filter': '${ _('Add filter') }',
@@ -762,6 +774,9 @@
   };
 
   window.HUE_VERSION = '${ hue_version() }';
+  % if is_admin(user):
+  window.PYTHON_VERSION = '${ sys.version.split(' ')[0] }';
+  % endif
 
   %if hasattr(ENABLE_NEW_INDEXER, 'get') and ENABLE_NEW_INDEXER.get():
     window.IS_NEW_INDEXER_ENABLED = true;
@@ -790,6 +805,8 @@
   window.USER_IS_ADMIN = '${ is_admin(user) }' === 'True';
   window.USER_IS_HUE_ADMIN = '${ is_hue_admin(user) }' === 'True';
   window.DJANGO_DEBUG_MODE = '${ conf.DJANGO_DEBUG_MODE.get() }' === 'True';
+  window.NONCE_ENABLED = ${ 'true' if conf.CSP_NONCE.get() else 'false' };
+
   window.IS_LDAP_SETUP = '${ 'desktop.auth.backend.LdapBackend' in conf.AUTH.BACKEND.get() }' === 'True';
   window.LOGGED_USERNAME = '${ user.username }';
   window.LOGGED_USER_ID = ${ user.id };

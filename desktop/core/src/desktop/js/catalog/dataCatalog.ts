@@ -146,8 +146,9 @@ const generateEntryCacheId = (options: {
   path?: string | string[];
   paths?: string[][];
   namespace: Namespace;
+  computeName: Compute['name'];
 }): string => {
-  let id = options.namespace.id;
+  let id = `${options.namespace.id}_${options.computeName}`;
   if (options.path) {
     if (typeof options.path === 'string') {
       id += '_' + options.path;
@@ -327,9 +328,13 @@ export class DataCatalog {
       return;
     }
 
-    const keyPrefix = generateEntryCacheId({ namespace: namespace, path: pathToClear });
+    const keyPrefix = generateEntryCacheId({
+      namespace: namespace,
+      path: pathToClear,
+      computeName: compute.name
+    });
     Object.keys(this.entries).forEach(key => {
-      if (key.indexOf(keyPrefix) === 0) {
+      if (key.startsWith(keyPrefix)) {
         delete this.entries[key];
       }
     });
@@ -338,7 +343,7 @@ export class DataCatalog {
     try {
       const keys = await this.store.keys();
       keys.forEach(key => {
-        if (key.indexOf(keyPrefix) === 0) {
+        if (key.startsWith(keyPrefix)) {
           deletePromises.push(this.store.removeItem(key));
         }
       });
@@ -354,7 +359,11 @@ export class DataCatalog {
     if (!cacheEnabled || !confTtl.default || confTtl.default <= 0) {
       return;
     }
-    const identifier = generateEntryCacheId(dataCatalogEntry);
+    const identifier = generateEntryCacheId({
+      namespace: dataCatalogEntry.namespace,
+      path: dataCatalogEntry.path,
+      computeName: dataCatalogEntry.compute.name
+    });
 
     await this.store.setItem<StoreEntry>(identifier, {
       version: DATA_CATALOG_VERSION,
@@ -515,7 +524,13 @@ export class DataCatalog {
     compute: Compute;
     path: string | string[];
   }): Promise<DataCatalogEntry> {
-    return this.entries[generateEntryCacheId(options)];
+    return this.entries[
+      generateEntryCacheId({
+        namespace: options.namespace,
+        path: options.path,
+        computeName: options.compute.name
+      })
+    ];
   }
 
   /**
@@ -537,7 +552,8 @@ export class DataCatalog {
 
     const sourceIdentifier = generateEntryCacheId({
       namespace: options.namespace,
-      path: []
+      path: [],
+      computeName: options.compute.name
     });
 
     // Create the source entry if not already present
@@ -564,7 +580,8 @@ export class DataCatalog {
       const existingTemporaryDatabases = await sourceEntry.getChildren();
       const databaseIdentifier = generateEntryCacheId({
         namespace: options.namespace,
-        path: [database]
+        path: [database],
+        computeName: options.compute.name
       });
 
       // Create the database entry if not already present
@@ -593,7 +610,8 @@ export class DataCatalog {
 
       const tableIdentifier = generateEntryCacheId({
         namespace: options.namespace,
-        path: path
+        path: path,
+        computeName: options.compute.name
       });
 
       // Unlink any existing table with the same identifier
@@ -677,7 +695,8 @@ export class DataCatalog {
 
         const columnIdentifier = generateEntryCacheId({
           namespace: options.namespace,
-          path: columnPath
+          path: columnPath,
+          computeName: options.compute.name
         });
         identifiersToClean.push(columnIdentifier);
         this.temporaryEntries[columnIdentifier] = CancellablePromise.resolve(columnEntry);
@@ -697,7 +716,10 @@ export class DataCatalog {
   }
 
   async getEntry(options: GetEntryOptions): Promise<DataCatalogEntry> {
-    const identifier = generateEntryCacheId(options);
+    const identifier = generateEntryCacheId({
+      ...options,
+      computeName: options.compute.name
+    });
     if (options.temporaryOnly) {
       return this.temporaryEntries[identifier] || $.Deferred().reject().promise();
     }
@@ -756,7 +778,11 @@ export class DataCatalog {
   }
 
   async getMultiTableEntry(options: GetMultiTableEntryOptions): Promise<MultiTableEntry> {
-    const identifier = generateEntryCacheId(options);
+    const identifier = generateEntryCacheId({
+      namespace: options.namespace,
+      paths: options.paths,
+      computeName: options.compute.name
+    });
     if (this.multiTableEntries[identifier]) {
       return this.multiTableEntries[identifier];
     }

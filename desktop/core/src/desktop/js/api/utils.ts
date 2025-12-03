@@ -20,7 +20,7 @@ import axios, {
   AxiosRequestConfig,
   AxiosResponse,
   AxiosResponseTransformer,
-  CancelToken
+  InternalAxiosRequestConfig
 } from 'axios';
 import qs from 'qs';
 
@@ -42,20 +42,34 @@ export interface DefaultApiResponse {
   content?: string;
 }
 
-export interface ApiFetchOptions<T, E = string> extends AxiosRequestConfig {
+export enum HttpMethod {
+  POST = 'post',
+  PUT = 'put',
+  PATCH = 'patch'
+}
+
+/**
+ * Options for API fetch functions.
+ *
+ * Note: This extends AxiosRequestConfig (not InternalAxiosRequestConfig) because it's the
+ * public API for users to pass options to axios requests. InternalAxiosRequestConfig is
+ * only used for the internal config object inside interceptors.
+ */
+export interface ApiFetchOptions<T, E = AxiosError<DefaultApiResponse>> extends AxiosRequestConfig {
   silenceErrors?: boolean;
   ignoreSuccessErrors?: boolean;
   transformResponse?: AxiosResponseTransformer;
   qsEncodeData?: boolean;
+  isRawError?: boolean;
   handleSuccess?: (
     response: T & DefaultApiResponse,
     resolve: (val: T) => void,
     reject: (err: unknown) => void
   ) => void;
   handleError?: (
-    errorResponse: AxiosError<E>,
+    errorResponse: AxiosError<DefaultApiResponse>,
     resolve: (val: T) => void,
-    reject: (err: unknown) => void
+    reject: (err: E) => void
   ) => void;
 }
 
@@ -64,7 +78,7 @@ const axiosInstance = axios.create({ withCredentials: true });
 let baseUrl = (window as hueWindow).HUE_BASE_URL;
 let bearerToken: string | undefined;
 
-axiosInstance.interceptors.request.use(config => {
+axiosInstance.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   if (baseUrl) {
     config.baseURL = baseUrl;
   }
@@ -104,7 +118,7 @@ export const successResponseIsError = (responseData?: DefaultApiResponse): boole
 const UNKNOWN_ERROR_MESSAGE = 'Unknown error occurred';
 
 export const extractErrorMessage = (
-  errorResponse?: DefaultApiResponse | AxiosError | string
+  errorResponse?: DefaultApiResponse | AxiosError<DefaultApiResponse> | string
 ): string => {
   if (!errorResponse) {
     return UNKNOWN_ERROR_MESSAGE;
@@ -147,7 +161,7 @@ const notifyError = <T>(
 ): void => {
   if (!options || !options.silenceErrors) {
     logError(response);
-    if (message.indexOf('AuthorizationException') === -1) {
+    if (!message.includes('AuthorizationException')) {
       huePubSub.publish<HueAlert>(GLOBAL_ERROR_TOPIC, { message });
     }
   }
@@ -156,18 +170,22 @@ const notifyError = <T>(
 const handleErrorResponse = <T>(
   err: AxiosError<DefaultApiResponse>,
   reject: (reason?: unknown) => void,
-  options?: Pick<ApiFetchOptions<T>, 'silenceErrors'>
+  options?: Pick<ApiFetchOptions<T>, 'silenceErrors' | 'isRawError'>
 ): void => {
   const errorMessage = extractErrorMessage(err.response && err.response.data);
-  reject(errorMessage);
+  if (options?.isRawError) {
+    reject(err);
+  } else {
+    reject(errorMessage);
+  }
   notifyError(errorMessage, (err && err.response) || err, options);
 };
 
-const handleResponse = <T>(
+const handleResponse = <T, E = unknown>(
   response: AxiosResponse<T & DefaultApiResponse>,
   resolve: (value?: T) => void,
   reject: (reason?: unknown) => void,
-  options?: ApiFetchOptions<T>
+  options?: ApiFetchOptions<T, E>
 ): void => {
   if (options && options.handleSuccess) {
     options.handleSuccess(response.data, resolve, reason => {
@@ -183,31 +201,38 @@ const handleResponse = <T>(
   }
 };
 
-const getCancelToken = (): { cancelToken: CancelToken; cancel: () => void } => {
-  const cancelTokenSource = axios.CancelToken.source();
-  return { cancelToken: cancelTokenSource.token, cancel: cancelTokenSource.cancel };
+/**
+ * Creates an AbortController for cancelling axios requests.
+ * This replaces the deprecated CancelToken API with the standard AbortController API.
+ *
+ * @returns An object containing the AbortSignal and abort function
+ */
+const getAbortController = (): { signal: AbortSignal; abort: () => void } => {
+  const controller = new AbortController();
+  return { signal: controller.signal, abort: () => controller.abort() };
 };
 
-export const post = <T, U = unknown>(
+// Shared HTTP method for post, put, patch requests
+export const sendApiRequest = <T, U = unknown, E = AxiosError>(
+  method: HttpMethod,
   url: string,
   data?: U,
-  options?: ApiFetchOptions<T>
+  options?: ApiFetchOptions<T, E>
 ): CancellablePromise<T> =>
   new CancellablePromise((resolve, reject, onCancel) => {
-    const { cancelToken, cancel } = getCancelToken();
+    const { signal, abort } = getAbortController();
     let completed = false;
 
     const encodeData = options?.qsEncodeData == undefined || options?.qsEncodeData;
 
-    axiosInstance
-      .post<T & DefaultApiResponse>(url, encodeData ? qs.stringify(data) : data, {
-        cancelToken,
-        ...options
-      })
+    axiosInstance[method]<T & DefaultApiResponse>(url, encodeData ? qs.stringify(data) : data, {
+      signal,
+      ...options
+    })
       .then(response => {
         handleResponse(response, resolve, reject, options);
       })
-      .catch((err: AxiosError) => {
+      .catch((err: AxiosError<DefaultApiResponse>) => {
         if (options && options.handleError) {
           options.handleError(err, resolve, reason => {
             handleErrorResponse(err, reject, options);
@@ -223,29 +248,47 @@ export const post = <T, U = unknown>(
 
     onCancel(() => {
       if (!completed) {
-        cancel();
+        abort();
       }
     });
   });
 
-export const get = <T, U = unknown>(
+export const post = <T, U = unknown, E = AxiosError>(
   url: string,
   data?: U,
-  options?: ApiFetchOptions<T>
+  options?: ApiFetchOptions<T, E>
+): CancellablePromise<T> => sendApiRequest(HttpMethod.POST, url, data, options);
+
+export const put = <T, U = unknown, E = AxiosError>(
+  url: string,
+  data?: U,
+  options?: ApiFetchOptions<T, E>
+): CancellablePromise<T> => sendApiRequest(HttpMethod.PUT, url, data, options);
+
+export const patch = <T, U = unknown, E = AxiosError>(
+  url: string,
+  data?: U,
+  options?: ApiFetchOptions<T, E>
+): CancellablePromise<T> => sendApiRequest(HttpMethod.PATCH, url, data, options);
+
+export const get = <T, U = unknown, E = AxiosError<DefaultApiResponse>>(
+  url: string,
+  data?: U,
+  options?: ApiFetchOptions<T, E>
 ): CancellablePromise<T> =>
   new CancellablePromise((resolve, reject, onCancel) => {
-    const { cancelToken, cancel } = getCancelToken();
+    const { signal, abort } = getAbortController();
     let completed = false;
 
     axiosInstance
       .get<T & DefaultApiResponse>(url, {
-        cancelToken,
+        signal,
         params: data
       })
       .then(response => {
         handleResponse(response, resolve, reject, options);
       })
-      .catch((err: AxiosError) => {
+      .catch((err: AxiosError<DefaultApiResponse>) => {
         handleErrorResponse(err, reject, options);
       })
       .finally(() => {
@@ -254,7 +297,7 @@ export const get = <T, U = unknown>(
 
     onCancel(() => {
       if (!completed) {
-        cancel();
+        abort();
       }
     });
   });

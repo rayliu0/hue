@@ -111,6 +111,11 @@ $.ajaxSetup({
   }
 });
 
+/**
+ * Interceptor for axios requests in tests
+ * @param {import('axios').InternalAxiosRequestConfig} config
+ * @returns {import('axios').InternalAxiosRequestConfig}
+ */
 const axiosConfigInterceptor = config => {
   console.warn('Actual axios ajax request made to url: ' + config.url);
   console.trace();
@@ -124,7 +129,14 @@ process.on('unhandledRejection', err => {
   fail(err);
 });
 
-jest.mock('../utils/i18nReact');
+jest.mock('../utils/i18nReact', () => ({
+  i18nReact: {
+    useTranslation: () => ({
+      t: key => key, // The mock t() function just returns the key
+      ready: true
+    })
+  }
+}));
 jest.mock('../utils/hueAnalytics');
 
 //Official workaround for TypeError: window.matchMedia is not a function
@@ -142,3 +154,11 @@ Object.defineProperty(window, 'matchMedia', {
     dispatchEvent: jest.fn()
   }))
 });
+
+class ResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+global.ResizeObserver = ResizeObserver;

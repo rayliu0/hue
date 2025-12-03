@@ -15,23 +15,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from future import standard_library
-standard_library.install_aliases()
-
-from builtins import zip
-from past.builtins import basestring
 import csv
 import json
 import logging
-import urllib.error
-import openpyxl
 import re
-import sys
 import tempfile
 import uuid
+from urllib.parse import unquote as urllib_unquote
 
+import pandas as pd
 from django.urls import reverse
+from django.utils.translation import gettext as _
 from django.views.decorators.http import require_POST
+from past.builtins import basestring
+
+from desktop.lib.django_util import JsonResponse
+from desktop.lib.exceptions_renderable import PopupException
+from desktop.lib.i18n import smart_str
+from desktop.lib.python_util import check_encoding
+from desktop.models import Document2
+from filebrowser.forms import UploadLocalFileForm
+from indexer.controller import CollectionManagerController
+from indexer.fields import Field, guess_field_type_from_samples
+from indexer.file_format import get_file_format_instance, HiveFormat
+from indexer.indexers.envelope import _envelope_job
+from indexer.indexers.flink_sql import FlinkIndexer
+from indexer.indexers.flume import FlumeIndexer
+from indexer.indexers.morphline import _create_solr_collection, MorphlineIndexer
+from indexer.indexers.phoenix_sql import PhoenixIndexer
+from indexer.indexers.rdbms import _get_api, run_sqoop
+from indexer.indexers.sql import _create_database, _create_table, _create_table_from_local
+from indexer.models import _save_pipeline
+from indexer.solr_client import MAX_UPLOAD_SIZE, SolrClient
+from kafka.kafka_api import get_topic_data, get_topics
+from notebook.connectors.base import get_api, Notebook
+from notebook.decorators import api_error_handler
+from notebook.models import escape_rows, MockedDjangoRequest
 
 LOG = logging.getLogger()
 
@@ -41,56 +60,29 @@ try:
 except ImportError:
   LOG.warning('simple_salesforce module not found')
 
-from desktop.lib.django_util import JsonResponse
-from desktop.lib.exceptions_renderable import PopupException
-from desktop.lib.i18n import smart_unicode
-from desktop.lib.python_util import check_encoding
-from desktop.models import Document2
-from filebrowser.forms import UploadLocalFileForm
-from kafka.kafka_api import get_topics, get_topic_data
-from notebook.connectors.base import get_api, Notebook
-from notebook.decorators import api_error_handler
-from notebook.models import MockedDjangoRequest, escape_rows
-
-from indexer.controller import CollectionManagerController
-from indexer.file_format import HiveFormat
-from indexer.fields import Field, guess_field_type_from_samples
-from indexer.indexers.envelope import _envelope_job
-from indexer.indexers.base import get_api
-from indexer.indexers.flink_sql import FlinkIndexer
-from indexer.indexers.morphline import MorphlineIndexer, _create_solr_collection
-from indexer.indexers.phoenix_sql import PhoenixIndexer
-from indexer.indexers.rdbms import run_sqoop, _get_api
-from indexer.indexers.sql import _create_database, _create_table, _create_table_from_local
-from indexer.models import _save_pipeline
-from indexer.solr_client import SolrClient, MAX_UPLOAD_SIZE
-from indexer.indexers.flume import FlumeIndexer
-
-
-if sys.version_info[0] > 2:
-  from io import StringIO as string_io
-  from urllib.parse import urlparse, unquote as urllib_unquote
-  from django.utils.translation import gettext as _
-  import pandas as pd
-else:
-  from StringIO import StringIO as string_io
-  from urllib import unquote as urllib_unquote
-  from urlparse import urlparse
-  from django.utils.translation import ugettext as _
-
 try:
   from beeswax.server import dbms
-except ImportError as e:
+except ImportError:
   LOG.warning('Hive and HiveServer2 interfaces are not enabled')
 
 try:
-  from filebrowser.views import detect_parquet
-except ImportError as e:
+  import importlib.util
+  spec = importlib.util.find_spec('filebrowser.views.detect_parquet')
+  if spec is None:
+    LOG.warning('detect_parquet function not available in filebrowser.views')
+except ImportError:
   LOG.warning('File Browser interface is not enabled')
 
 try:
-  from search.conf import SOLR_URL
-except ImportError as e:
+  import importlib.util
+  spec = importlib.util.find_spec('search.conf')
+  if spec is not None:
+    import search.conf
+    if not hasattr(search.conf, 'SOLR_URL'):
+      LOG.warning('SOLR_URL not available in search.conf')
+  else:
+    LOG.warning('Solr Search interface is not enabled')
+except ImportError:
   LOG.warning('Solr Search interface is not enabled')
 
 
@@ -106,10 +98,7 @@ def _escape_white_space_characters(s, inverse=False):
   from_ = 0 if inverse else 1
 
   for pair in MAPPINGS.items():
-    if sys.version_info[0] > 2:
-      s = s.replace(pair[to], pair[from_])
-    else:
-      s = s.replace(pair[to], pair[from_]).encode('utf-8')
+    s = s.replace(pair[to], pair[from_])
 
   return s
 
@@ -125,9 +114,6 @@ def guess_format(request):
   file_format = json.loads(request.POST.get('fileFormat', '{}'))
   file_type = file_format['file_type']
   path = file_format["path"]
-  
-  if sys.version_info[0] < 3 and (file_type == 'excel' or path[-3:] == 'xls' or path[-4:] == 'xlsx'):
-    return JsonResponse({'status': -1, 'message': 'Python2 based Hue does not support Excel file importer'})
 
   if file_format['inputFormat'] == 'localfile':
     if file_type == 'excel':
@@ -156,20 +142,17 @@ def guess_format(request):
       path = excel_to_csv_file_name_change(path)
       request.fs.create(path, overwrite=True, data=_csv_data)
 
-    indexer = MorphlineIndexer(request.user, request.fs)
     if not request.fs.isfile(path):
       raise PopupException(_('Path %(path)s is not a file') % file_format)
 
     stream = request.fs.open(path)
-    format_ = indexer.guess_format({
-      "file": {
-        "stream": stream,
-        "name": path
-      }
-    })
+    format_ = get_file_format_instance({
+      "stream": stream,
+      "name": path
+    }).get_format()
     _convert_format(format_)
 
-    if file_format["path"][-3:] == 'xls' or file_format["path"][-4:] == 'xlsx': 
+    if file_format["path"][-3:] == 'xls' or file_format["path"][-4:] == 'xlsx':
       format_ = {
           "quoteChar": "\"",
           "recordSeparator": '\\n',
@@ -201,7 +184,7 @@ def guess_format(request):
         "fieldSeparator": storage.get('field.delim', ',')
       }
     elif table_metadata.details['properties']['format'] == 'parquet':
-      format_ = {"type": "parquet", "hasHeader": False,}
+      format_ = {"type": "parquet", "hasHeader": False, }
     else:
       raise PopupException('Hive table format %s is not supported.' % table_metadata.details['properties']['format'])
   elif file_format['inputFormat'] == 'query':
@@ -255,9 +238,11 @@ def guess_format(request):
   format_['status'] = 0
   return JsonResponse(format_)
 
+
 def decode_utf8(input_iterator):
-  for l in input_iterator:
-    yield l.decode('utf-8')
+  for line in input_iterator:
+    yield line.decode('utf-8')
+
 
 def guess_field_types(request):
   file_format = json.loads(request.POST.get('fileFormat', '{}'))
@@ -275,7 +260,7 @@ def guess_field_types(request):
         column_row = [re.sub('[^0-9a-zA-Z]+', '_', col) for col in csv_data[0]]
       else:
         sample = csv_data[:4]
-        column_row = ['field_' + str(count+1) for count, col in enumerate(sample[0])]
+        column_row = ['field_' + str(count + 1) for count, col in enumerate(sample[0])]
 
       field_type_guesses = []
       for count, col in enumerate(column_row):
@@ -294,7 +279,6 @@ def guess_field_types(request):
       }
 
   elif file_format['inputFormat'] == 'file':
-    indexer = MorphlineIndexer(request.user, request.fs)
     path = file_format["path"]
 
     if path[-3:] == 'xls' or path[-4:] == 'xlsx':
@@ -305,19 +289,14 @@ def guess_field_types(request):
     stream.seek(0)
     _convert_format(file_format["format"], inverse=True)
 
-    format_ = indexer.guess_field_types({
-      "file": {
-          "stream": stream,
-          "name": path
-        },
-      "format": file_format['format']
-    })
+    file_format_instance = get_file_format_instance({"stream": stream, "name": path}, file_format['format'])
+    format_ = file_format_instance.get_fields() if file_format_instance else {'columns': []}
 
     # Note: Would also need to set charset to table (only supported in Hive)
     if 'sample' in format_ and format_['sample']:
       format_['sample'] = escape_rows(format_['sample'], nulls_only=True, encoding=encoding)
     for col in format_['columns']:
-      col['name'] = smart_unicode(col['name'], errors='replace', encoding=encoding)
+      col['name'] = smart_str(col['name'], errors='replace', encoding=encoding)
 
   elif file_format['inputFormat'] == 'table':
     sample = get_api(
@@ -378,7 +357,6 @@ def guess_field_types(request):
       )
 
       kafkaFieldNames = [col['name'] for col in data['full_headers']]
-      kafkaFieldTypes = [col['type'] for col in data['full_headers']]
       topics_data = data['rows']
 
       format_ = {
@@ -651,7 +629,7 @@ def _small_indexing(user, fs, client, source, destination, index_name):
           rows=rows,
           start_over=start_over
       )
-      rows = searcher.update_data_from_hive(
+      searcher.update_data_from_hive(
           index_name,
           columns,
           fetch_handle=fetch_handle,
@@ -659,7 +637,7 @@ def _small_indexing(user, fs, client, source, destination, index_name):
       )
       # TODO if rows == MAX_ROWS truncation warning
     elif source['inputFormat'] == 'manual':
-      pass # No need to do anything
+      pass  # No need to do anything
     else:
       response = client.index(name=index_name, data=data, **kwargs)
       errors = [error.get('message', '') for error in response['responseHeader'].get('errors', [])]
@@ -691,7 +669,7 @@ def _large_indexing(request, file_format, collection_name, query=None, start_tim
 
   client = SolrClient(user=request.user)
 
-  if not client.exists(collection_name) and not request.POST.get('show_command'): # if destination['isTargetExisting']:
+  if not client.exists(collection_name) and not request.POST.get('show_command'):  # if destination['isTargetExisting']:
     client.create_index(
       name=collection_name,
       fields=request.POST.get('fields', schema_fields),
@@ -786,12 +764,12 @@ def upload_local_file(request):
       read_file = pd.read_excel(upload_file)
     else:
       read_file = pd.read_excel(upload_file, engine='xlrd')
-  
+
     temp_file = tempfile.NamedTemporaryFile(mode='w', prefix=filename, suffix='.csv', delete=False)
     read_file.to_csv(temp_file, index=False)
     file_type = 'excel'
 
-  else: 
+  else:
     temp_file = tempfile.NamedTemporaryFile(prefix=filename, suffix='.csv', delete=False)
     temp_file.write(upload_file.read())
 

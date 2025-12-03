@@ -15,31 +15,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from builtins import range, object
+import json
 import logging
 import re
-import sys
-import time
 import textwrap
-import json
+import time
+from builtins import object
+
+from django.utils.translation import gettext as _
 
 from beeswax.server.dbms import Table
-
+from desktop.auth.backend import rewrite_user
 from desktop.conf import USE_DEFAULT_CONFIGURATION
 from desktop.lib.exceptions_renderable import PopupException
 from desktop.lib.i18n import force_unicode
 from desktop.lib.rest.http_client import RestException
 from desktop.models import DefaultConfiguration
-from desktop.auth.backend import rewrite_user
-
-from notebook.data_export import download as spark_download
-from notebook.connectors.base import Api, QueryError, SessionExpired, _get_snippet_session
-
-if sys.version_info[0] > 2:
-  from django.utils.translation import gettext as _
-else:
-  from django.utils.translation import ugettext as _
-
+from notebook.connectors.base import _get_snippet_session, Api, QueryError, SessionExpired
 
 LOG = logging.getLogger()
 
@@ -47,25 +39,23 @@ LOG = logging.getLogger()
 try:
   from spark.conf import LIVY_SERVER_SESSION_KIND
   from spark.livy_client import get_api as get_spark_api
-except ImportError as e:
+except ImportError:
   LOG.exception('Spark is not enabled')
 
 SESSION_KEY = '%(username)s-%(interpreter_name)s'
 
+
 class SparkApi(Api):
 
-  SPARK_UI_RE = re.compile("Started SparkUI at (http[s]?://([0-9a-zA-Z-_\.]+):(\d+))")
+  SPARK_UI_RE = re.compile(r"Started SparkUI at (http[s]?://([0-9a-zA-Z-_\.]+):(\d+))")
   YARN_JOB_RE = re.compile("tracking URL: (http[s]?://.+/)")
-  STANDALONE_JOB_RE = re.compile("Got job (\d+)")
-
+  STANDALONE_JOB_RE = re.compile(r"Got job (\d+)")
 
   def __init__(self, user, interpreter):
     super(SparkApi, self).__init__(user=user, interpreter=interpreter)
 
-
   def get_api(self):
     return get_spark_api(self.user, self.interpreter)
-
 
   @staticmethod
   def get_livy_props(lang, properties=None):
@@ -100,7 +90,6 @@ class SparkApi(Api):
 
     return props
 
-
   @staticmethod
   def to_properties(props=None):
     properties = list()
@@ -114,13 +103,11 @@ class SparkApi(Api):
 
     return properties
 
-
   def _get_session_key(self):
     return SESSION_KEY % {
       'username': self.user.username if hasattr(self.user, 'username') else self.user,
       'interpreter_name': self.interpreter['name']
     }
-
 
   def _check_session(self, session):
     '''
@@ -129,12 +116,11 @@ class SparkApi(Api):
     api = self.get_api()
     try:
       session_present = api.get_session(session['id'])
-    except Exception as e:
+    except Exception:
       session_present = None
 
     if session_present and session_present['state'] not in ('dead', 'shutting_down', 'error', 'killed'):
       return session_present
-
 
   def create_session(self, lang='scala', properties=None):
     api = self.get_api()
@@ -174,7 +160,6 @@ class SparkApi(Api):
     self._set_session_info_to_user(new_session_info)
 
     return new_session_info
-    
 
   def execute(self, notebook, snippet):
     api = self.get_api()
@@ -182,7 +167,6 @@ class SparkApi(Api):
 
     response = self._execute(api, session, snippet.get('type'), snippet['statement'])
     return response
-
 
   def _execute(self, api, session, snippet_type, statement):
     if not session or not self._check_session(session):
@@ -201,11 +185,10 @@ class SparkApi(Api):
       }
     except Exception as e:
       message = force_unicode(str(e)).lower()
-      if re.search("session ('\d+' )?not found", message) or 'connection refused' in message or 'session is in state busy' in message:
+      if re.search(r"session ('\d+' )?not found", message) or 'connection refused' in message or 'session is in state busy' in message:
         raise SessionExpired(e)
       else:
         raise e
-
 
   def check_status(self, notebook, snippet):
     api = self.get_api()
@@ -221,11 +204,10 @@ class SparkApi(Api):
       }
     except Exception as e:
       message = force_unicode(str(e)).lower()
-      if re.search("session ('\d+' )?not found", message):
+      if re.search(r"session ('\d+' )?not found", message):
         raise SessionExpired(e)
       else:
         raise e
-
 
   def fetch_result(self, notebook, snippet, rows, start_over=False):
     api = self.get_api()
@@ -243,13 +225,12 @@ class SparkApi(Api):
 
     return response
 
-
   def _fetch_result(self, api, session, cell):
     try:
       response = api.fetch_data(session['id'], cell)
     except Exception as e:
       message = force_unicode(str(e))
-      if re.search("session ('\d+' )?not found", message):
+      if re.search(r"session ('\d+' )?not found", message):
         raise SessionExpired(e)
       else:
         raise PopupException(_(message))
@@ -301,13 +282,12 @@ class SparkApi(Api):
 
       raise QueryError(msg)
 
-
   def _handle_result_data(self, result, is_complex_type=False):
     """
     Parse the data from the 'result' dict based on whether it has complex datatypes or not.
 
-    If the 'is_complex_type' flag is True, it parses the result dict, checking for 'schema' and 'values' 
-    and if found, formatting them into a appropriate result data dictionary representing that result column. 
+    If the 'is_complex_type' flag is True, it parses the result dict, checking for 'schema' and 'values'
+    and if found, formatting them into a appropriate result data dictionary representing that result column.
     If the flag is False, it simply returns the 'data' as is.
 
     Args:
@@ -337,9 +317,8 @@ class SparkApi(Api):
     else:
       # If the query result is not having complex datatype, return the 'data' as it is.
       data = result['data']
-    
-    return data
 
+    return data
 
   def _handle_result_meta(self, result):
     meta = []
@@ -357,9 +336,8 @@ class SparkApi(Api):
         meta.append({'name': f['name'], 'type': complex_type, 'comment': ''})
       else:
         meta.append({'name': f['name'], 'type': f['type'], 'comment': ''})
-    
-    return meta, is_complex_type
 
+    return meta, is_complex_type
 
   def cancel(self, notebook, snippet):
     api = self.get_api()
@@ -368,13 +346,12 @@ class SparkApi(Api):
     session = self._handle_session_health_check(session)
 
     try:
-      response = api.cancel(session['id'])
+      api.cancel(session['id'])
     except Exception as e:
       message = force_unicode(str(e)).lower()
       LOG.debug(message)
 
     return {'status': 0}
-
 
   def get_log(self, notebook, snippet, startFrom=0, size=None):
     response = {'status': 0}
@@ -389,7 +366,6 @@ class SparkApi(Api):
       LOG.debug(message)
 
     return response
-  
 
   def _handle_session_health_check(self, session):
     if not session or not self._check_session(session):
@@ -398,13 +374,11 @@ class SparkApi(Api):
         session = stored_session_info
       else:
         raise PopupException(_("Session error. Please create new session and try again."))
-    
+
     return session
 
-
-  def close_statement(self, notebook, snippet): # Individual statements cannot be closed
+  def close_statement(self, notebook, snippet):  # Individual statements cannot be closed
     pass
-
 
   def close_session(self, session):
     api = self.get_api()
@@ -417,7 +391,7 @@ class SparkApi(Api):
           'status': 0
         }
       except RestException as e:
-        if e.code == 404 or e.code == 500: # TODO remove the 500
+        if e.code == 404 or e.code == 500:  # TODO remove the 500
           raise SessionExpired(e)
       finally:
         stored_session_info = self._get_session_info_from_user()
@@ -426,7 +400,6 @@ class SparkApi(Api):
     else:
       return {'status': -1}
 
-
   def get_jobs(self, notebook, snippet, logs):
     if self._is_yarn_mode():
       # Tracking URL is found at the start of the logs
@@ -434,7 +407,6 @@ class SparkApi(Api):
       return self._get_yarn_jobs(start_logs)
     else:
       return self._get_standalone_jobs(logs)
-
 
   def autocomplete(self, snippet, database=None, table=None, column=None, nested=None, operation=None):
     response = {}
@@ -446,7 +418,7 @@ class SparkApi(Api):
     # Calling the method here since this /autocomplete call can be frequent enough and we dont need dedicated one.
     if self._get_session_info_from_user():
       self._close_unused_sessions(snippet.get('type'))
-    
+
     stored_session_info = self._get_session_info_from_user()
     if stored_session_info and self._check_session(stored_session_info):
       session = stored_session_info
@@ -470,7 +442,6 @@ class SparkApi(Api):
 
     return response
 
-
   def _close_unused_sessions(self, session_type):
     '''
     Closes all unused Livy sessions for a particular user to free up session resources.
@@ -493,7 +464,6 @@ class SparkApi(Api):
           session['kind'] == session_type and session['state'] in ('idle', 'shutting_down', 'error', 'dead', 'killed'):
           self.close_session(session)
 
-
   def _check_status_and_fetch_result(self, api, session, execute_resp):
     check_status = api.fetch_data(session['id'], execute_resp['id'])
 
@@ -506,7 +476,6 @@ class SparkApi(Api):
     if check_status['state'] == 'available':
       return self._fetch_result(api, session, execute_resp['id'])
 
-
   def _show_databases(self, api, session, snippet_type):
     show_db_execute = self._execute(api, session, snippet_type, 'SHOW DATABASES')
     db_list = self._check_status_and_fetch_result(api, session, show_db_execute)
@@ -514,10 +483,9 @@ class SparkApi(Api):
     if db_list:
       return [db[0] for db in db_list['data']]
 
-
   def _show_tables(self, api, session, snippet_type, database):
     use_db_execute = self._execute(api, session, snippet_type, 'USE %(database)s' % {'database': database})
-    use_db_resp = self._check_status_and_fetch_result(api, session, use_db_execute)
+    self._check_status_and_fetch_result(api, session, use_db_execute)
 
     show_tables_execute = self._execute(api, session, snippet_type, 'SHOW TABLES')
     tables_list = self._check_status_and_fetch_result(api, session, show_tables_execute)
@@ -525,10 +493,9 @@ class SparkApi(Api):
     if tables_list:
       return [table[1] for table in tables_list['data']]
 
-
   def _get_columns(self, api, session, snippet_type, database, table):
     use_db_execute = self._execute(api, session, snippet_type, 'USE %(database)s' % {'database': database})
-    use_db_resp = self._check_status_and_fetch_result(api, session, use_db_execute)
+    self._check_status_and_fetch_result(api, session, use_db_execute)
 
     describe_tables_execute = self._execute(api, session, snippet_type, 'DESCRIBE %(table)s' % {'table': table})
     columns_list = self._check_status_and_fetch_result(api, session, describe_tables_execute)
@@ -550,8 +517,7 @@ class SparkApi(Api):
 
       return cols
 
-
-  def get_sample_data(self, snippet, database=None, table=None, column=None, is_async=False, operation=None):
+  def get_sample_data(self, snippet, database=None, table=None, column=None, nested=None, is_async=False, operation=None):
     api = self.get_api()
     response = {
       'status': 0,
@@ -578,7 +544,6 @@ class SparkApi(Api):
       if stat.get('data_type') and stat['data_type'] == 'transactional' and stat.get('col_name'):
         return response
 
-
     statement = self._get_select_query(database, table, column, operation)
 
     sample_execute = self._execute(api, session, snippet.get('type'), statement)
@@ -589,11 +554,9 @@ class SparkApi(Api):
 
     return response
 
-
   def get_browse_query(self, snippet, database, table, partition_spec=None):
     return self._get_select_query(database, table)
 
-  
   def _get_select_query(self, database, table, column=None, operation=None, limit=100):
     if operation == 'hello':
       statement = "SELECT 'Hello World!'"
@@ -611,7 +574,6 @@ class SparkApi(Api):
         })
 
     return statement
-
 
   def describe_table(self, notebook, snippet, database=None, table=None):
     api = self.get_api()
@@ -644,7 +606,6 @@ class SparkApi(Api):
       'stats': tb.stats
     }
 
-
   def describe_database(self, notebook, snippet, database=None):
     response = {'status': 0}
     api = self.get_api()
@@ -675,7 +636,6 @@ class SparkApi(Api):
 
     return response
 
-
   def _get_standalone_jobs(self, logs):
     job_ids = set([])
 
@@ -700,7 +660,6 @@ class SparkApi(Api):
 
     return jobs
 
-
   def _get_yarn_jobs(self, logs):
     tracking_urls = set([])
 
@@ -716,10 +675,8 @@ class SparkApi(Api):
 
     return jobs
 
-
   def _is_yarn_mode(self):
     return LIVY_SERVER_SESSION_KIND.get() == "yarn"
-
 
   def _get_session_info_from_user(self):
     self.user = rewrite_user(self.user)
@@ -728,14 +685,12 @@ class SparkApi(Api):
     if self.user.profile.data.get(session_key):
       return self.user.profile.data[session_key]
 
-
   def _set_session_info_to_user(self, session_info):
     self.user = rewrite_user(self.user)
     session_key = self._get_session_key()
 
     self.user.profile.update_data({session_key: session_info})
     self.user.profile.save()
-
 
   def _remove_session_info_from_user(self):
     self.user = rewrite_user(self.user)
@@ -745,7 +700,7 @@ class SparkApi(Api):
       json_data = self.user.profile.data
       json_data.pop(session_key)
       self.user.profile.json_data = json.dumps(json_data)
-    
+
     self.user.profile.save()
 
 
@@ -767,7 +722,7 @@ class SparkDescribeTable(Table):
     self.stats = []
     self.cols = []
     self.partition_keys = []
-    self.primary_keys = [] # Not implemented
+    self.primary_keys = []  # Not implemented
     self.is_view = False
     self._details = None
 
@@ -808,7 +763,7 @@ class SparkDescribeTable(Table):
         })
 
       if d[0] == 'Table':
-        self.name = d[1] 
+        self.name = d[1]
       elif d[0] == 'Type':
         if 'view' in d[1].lower():
           self.is_view = True
@@ -840,7 +795,7 @@ class SparkDescribeTable(Table):
       elif 'LazySimpleSerDe' in self.serde:
         details_format = 'text'
       else:
-        details_format = serde.rsplit('.', 1)[-1]
+        details_format = self.serde.rsplit('.', 1)[-1]
 
       self._details = {
         'stats': self.stats,

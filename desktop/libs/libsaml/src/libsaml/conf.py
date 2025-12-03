@@ -19,14 +19,10 @@ import json
 import logging
 import os
 import subprocess
-import sys
 
-from desktop.lib.conf import Config, coerce_bool, coerce_csv, coerce_password_from_script
+from django.utils.translation import gettext as _, gettext_lazy as _t
 
-if sys.version_info[0] > 2:
-  from django.utils.translation import gettext_lazy as _t, gettext as _
-else:
-  from django.utils.translation import ugettext_lazy as _t, ugettext as _
+from desktop.lib.conf import coerce_bool, coerce_csv, coerce_password_from_script, Config
 
 LOG = logging.getLogger()
 
@@ -210,7 +206,20 @@ CDP_LOGOUT_URL = Config(
   key="logout_url",
   type=str,
   default="",
-  help=_t("To log users out of magic-sso, CDP control panel use Logout URL"))
+  help=_t("To log users out of control plane, CDP control plane use Logout URL"))
+
+REDIRECT_URL = Config(
+  key="redirect_url",
+  type=str,
+  default="",
+  help=_t("After log users out of control plane, CDP control plane redirect to this URL"))
+
+LOCAL_LOGOUT = Config(
+  key="local_logout",
+  type=coerce_bool,
+  default=True,
+  help=_t("Local logout only logout from Hue, but not IdP SAML"))
+
 
 def get_key_file_password():
   password = os.environ.get('HUE_SAML_KEY_FILE_PASSWORD')
@@ -230,10 +239,13 @@ def config_validator(user):
     res.append(("libsaml.username_source", _("username_source not configured properly. SAML integration may not work.")))
   return res
 
+
 def get_logout_redirect_url():
   # This logic was derived from KNOX.
-  prod_url = "consoleauth.altus.cloudera.com"
-  redirect_url = "https://sso.cloudera.com/bin/services/support/api/public/logout"
-  if prod_url not in CDP_LOGOUT_URL.get():
-    redirect_url = "https://sso.staging-upgrade.aem.cloudera.com/bin/services/support/api/public/logout"
+  if REDIRECT_URL.get():
+    redirect_url = REDIRECT_URL.get()
+  elif any(substr in CDP_LOGOUT_URL.get() for substr in ['-dev', '-int', '-stage']):
+    redirect_url = "https://sso-stg.cat.cloudera.com/logout"
+  else:
+    redirect_url = "https://sso.cloudera.com/logout"
   return redirect_url

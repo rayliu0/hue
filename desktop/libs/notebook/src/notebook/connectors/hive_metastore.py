@@ -16,22 +16,10 @@
 # limitations under the License.
 
 import logging
-import sys
-
-from django.urls import reverse
 
 from desktop.lib.exceptions import StructuredException
-from desktop.lib.exceptions_renderable import PopupException
-from desktop.lib.i18n import force_unicode, smart_str
-from desktop.lib.rest.http_client import RestException
-
-from notebook.connectors.base import Api, QueryError, QueryExpired, OperationTimeout, OperationNotSupported
-
-if sys.version_info[0] > 2:
-  from django.utils.translation import gettext as _
-else:
-  from django.utils.translation import ugettext as _
-
+from desktop.lib.i18n import force_unicode
+from notebook.connectors.base import Api, OperationTimeout, QueryError, QueryExpired
 
 LOG = logging.getLogger()
 
@@ -57,7 +45,7 @@ def query_error_handler(func):
         raise QueryError(message)
     except QueryServerException as e:
       message = force_unicode(str(e))
-      if 'Invalid query handle' in message or 'Invalid OperationHandle' in message:
+      if 'Invalid query handle' in message or 'Invalid OperationHandle' in message or 'Invalid or unknown query handle' in message:
         raise QueryExpired(e)
       else:
         raise QueryError(message)
@@ -72,11 +60,9 @@ class HiveMetastoreApi(Api):
 
     return _autocomplete(db, database, table, column, nested, query=None, cluster=self.cluster)
 
-
   @query_error_handler
-  def get_sample_data(self, snippet, database=None, table=None, column=None, is_async=False, operation=None):
+  def get_sample_data(self, snippet, database=None, table=None, column=None, nested=None, is_async=False, operation=None):
     return []
-
 
   def _get_db(self, snippet, is_async=False, cluster=None):
     return dbms.get(self.user, query_server=get_query_server_config(name='hms', cluster=cluster))

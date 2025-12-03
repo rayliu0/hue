@@ -17,37 +17,27 @@
 
 """
 Classes for a custom upload handler to stream into HDFS.
-
-Note that since our middlewares inspect request.POST, we cannot inject a custom
-handler into a specific view. Therefore we always use the HDFSfileUploadHandler,
-which is triggered by a magic prefix ("HDFS") in the field name.
-
-See http://docs.djangoproject.com/en/1.2/topics/http/file-uploads/
 """
 
-import os
-import sys
-import time
 import errno
 import logging
+import os
 import posixpath
+import time
 import unicodedata
 from builtins import object
 
 from django.core.files.uploadhandler import FileUploadHandler, SkipFile, StopFutureHandlers, StopUpload, UploadFileException
+from django.urls import reverse
+from django.utils.translation import gettext as _
 
 import hadoop.cluster
 from desktop.lib import fsmanager
 from desktop.lib.exceptions_renderable import PopupException
-from filebrowser.conf import ARCHIVE_UPLOAD_TEMPDIR
-from filebrowser.utils import calculate_total_size, generate_chunks
+from filebrowser.conf import ARCHIVE_UPLOAD_TEMPDIR, MAX_FILE_SIZE_UPLOAD_LIMIT
+from filebrowser.utils import calculate_total_size, generate_chunks, is_file_upload_allowed, massage_stats
 from hadoop.conf import UPLOAD_CHUNK_SIZE
 from hadoop.fs.exceptions import WebHdfsException
-
-if sys.version_info[0] > 2:
-  from django.utils.translation import gettext as _
-else:
-  from django.utils.translation import ugettext as _
 
 LOG = logging.getLogger()
 
@@ -74,6 +64,12 @@ class LocalFineUploaderChunkedUpload(object):
     self.chunk_size = 0
 
   def check_access(self):
+    # Check file extension restrictions
+    is_allowed, err_message = is_file_upload_allowed(self.file_name)
+    if not is_allowed:
+      LOG.error(err_message)
+      self._request.META["upload_failed"] = err_message
+      raise PopupException(err_message)
     pass
 
   def upload_chunks(self):
@@ -105,6 +101,13 @@ class HDFSFineUploaderChunkedUpload(object):
       self.chunk_size = kwargs.get('chunk_size')
 
   def check_access(self):
+    # Check file extension restrictions
+    is_allowed, err_message = is_file_upload_allowed(self.file_name)
+    if not is_allowed:
+      LOG.error(err_message)
+      self._request.META["upload_failed"] = err_message
+      raise PopupException(err_message)
+
     if self._request.fs.isdir(self.dest) and posixpath.sep in self.file_name:
       raise PopupException(_('HDFSFineUploaderChunkedUpload: Sorry, no "%(sep)s" in the filename %(name)s.' %
                              {'sep': posixpath.sep, 'name': self.file_name}))
@@ -198,6 +201,8 @@ class HDFStemporaryUploadedFile(object):
     if self._do_cleanup:
       # Do not do cleanup here. It's hopeless. The self._fs threadlocal states
       # are going to be all wrong.
+
+      # TODO: Check if this is required with new upload handler flow
       LOG.debug(f"Check for left-over upload file for cleanup if the upload op was unsuccessful: {self._path}")
 
   def get_temp_path(self):
@@ -207,7 +212,7 @@ class HDFStemporaryUploadedFile(object):
     try:
       self.size = size
       self.close()
-    except Exception as ex:
+    except Exception:
       LOG.exception('Error uploading file to %s' % (self._path,))
       raise
 
@@ -227,6 +232,43 @@ class HDFStemporaryUploadedFile(object):
 
   def close(self):
     self._file.close()
+
+
+class CustomDocumentsUploadHandler(FileUploadHandler):
+  """
+  Delegates the upload handling based on the request URL.
+
+  When the request URL starts with "/desktop/api2/doc/import" (indicating a document
+  import), delegate all processing to HDFSfileUploadHandler.
+  Otherwise, delegate to FineUploaderChunkedUploadHandler.
+  """
+
+  def __init__(self, request, *args, **kwargs):
+    super().__init__(request, *args, **kwargs)
+    import_path = reverse('import_documents')
+
+    if request.path.startswith(import_path):
+      self.delegate = HDFSfileUploadHandler(request)
+    else:
+      self.delegate = FineUploaderChunkedUploadHandler(request, *args, **kwargs)
+
+  def new_file(self, field_name, file_name, *args, **kwargs):
+    try:
+      if hasattr(self.delegate, 'new_file'):
+        result = self.delegate.new_file(field_name, file_name, *args, **kwargs)
+    except StopFutureHandlers:
+      result = None
+    return result
+
+  def receive_data_chunk(self, raw_data, start):
+    if hasattr(self.delegate, 'receive_data_chunk'):
+      return self.delegate.receive_data_chunk(raw_data, start)
+    return raw_data
+
+  def file_complete(self, file_size):
+    if hasattr(self.delegate, 'file_complete'):
+      return self.delegate.file_complete(file_size)
+    return None
 
 
 class FineUploaderChunkedUploadHandler(FileUploadHandler):
@@ -276,6 +318,7 @@ class FineUploaderChunkedUploadHandler(FileUploadHandler):
     LOG.debug('Uploaded %s bytes %s to in %s seconds' % (file_size, self.chunk_file_path, elapsed))
 
 
+# Deprecated and core logic to be replaced with HDFSNewFileUploadHandler
 class HDFSfileUploadHandler(FileUploadHandler):
   """
   Handle file upload by storing data in a temp HDFS file.
@@ -297,6 +340,7 @@ class HDFSfileUploadHandler(FileUploadHandler):
     self._activated = False
     self._destination = request.GET.get('dest', None)  # GET param avoids infinite looping
     self.request = request
+    self._upload_rejected = False
     fs = fsmanager.get_filesystem('default')
     if not fs:
       LOG.warning('No HDFS set for HDFS upload')
@@ -309,6 +353,15 @@ class HDFSfileUploadHandler(FileUploadHandler):
     # Detect "HDFS" in the field name.
     if field_name.upper().startswith('HDFS'):
       LOG.info('Using HDFSfileUploadHandler to handle file upload.')
+
+      # Check file extension restrictions
+      is_allowed, err_message = is_file_upload_allowed(file_name)
+      if not is_allowed:
+        LOG.error(err_message)
+        self.request.META['upload_failed'] = err_message
+        self._upload_rejected = True
+        return None
+
       try:
         fs_ref = self.request.GET.get('fs', 'default')
         self.request.fs = fsmanager.get_filesystem(fs_ref)
@@ -324,6 +377,9 @@ class HDFSfileUploadHandler(FileUploadHandler):
       raise StopFutureHandlers()
 
   def receive_data_chunk(self, raw_data, start):
+    if self._upload_rejected:
+      return None
+
     LOG.debug("HDFSfileUploadHandler receive_data_chunk")
 
     if not self._activated:
@@ -341,6 +397,9 @@ class HDFSfileUploadHandler(FileUploadHandler):
       raise StopUpload()
 
   def file_complete(self, file_size):
+    if self._upload_rejected:
+      return None
+
     if not self._activated:
       return None
 
@@ -353,3 +412,168 @@ class HDFSfileUploadHandler(FileUploadHandler):
     elapsed = time.time() - self._starttime
     LOG.info('Uploaded %s bytes to HDFS in %s seconds' % (file_size, elapsed))
     return self._file
+
+
+class HDFSNewFileUploadHandler(FileUploadHandler):
+  """
+  Handles direct file uploads to HDFS using streaming append operations.
+
+  This handler creates the file directly in HDFS and appends chunks as they arrive,
+  leveraging HDFS's native append capabilities for efficient streaming uploads.
+
+  Key features:
+  - Direct streaming to HDFS (no temporary files)
+  - Uses HDFS append API for chunk-by-chunk uploads
+  - Automatic cleanup on failure
+  - Comprehensive validation and security checks
+  """
+
+  def __init__(self, fs, dest_path, overwrite):
+    self.chunk_size = UPLOAD_CHUNK_SIZE.get()
+    self._fs = fs
+    self.dest_path = dest_path
+    self.overwrite = overwrite
+    self.total_bytes_received = 0
+    self.target_file_path = None
+
+    LOG.info(f"HDFSNewFileUploadHandler initialized - destination: {dest_path}, overwrite: {overwrite}")
+
+  def new_file(self, field_name, file_name, *args, **kwargs):
+    super(HDFSNewFileUploadHandler, self).new_file(field_name, file_name, *args, **kwargs)
+
+    LOG.info(f"Starting HDFS upload for file: {file_name}")
+
+    # Validate upload prerequisites
+    self._validate_upload_prerequisites(file_name)
+
+    self.target_file_path = self._fs.join(self.dest_path, file_name)
+
+    # Create the file directly at the destination
+    try:
+      LOG.debug(f"Creating HDFS file at {self.target_file_path}")
+      self._fs.create(
+        self.target_file_path,
+        overwrite=False,  # We already handled overwrite above
+        permission=self._fs.getDefaultFilePerms(),
+      )
+      LOG.info(f"HDFS file created successfully for {self.target_file_path}")
+    except Exception as ex:
+      LOG.error(f"Failed to create HDFS file for upload: {ex}")
+      raise PopupException(f"Failed to initiate HDFS upload: {ex}", error_code=500)
+
+  def _validate_upload_prerequisites(self, file_name):
+    """Validate all prerequisites before initiating file upload to HDFS.
+
+    Performs security and permission checks including:
+    - File extension restrictions
+    - Destination path existence and type validation
+    - Directory traversal attack prevention
+    - Write permission verification
+    - File overwrite handling based on policy
+
+    Args:
+      file_name: Name of the file to be uploaded.
+
+    Raises:
+      PopupException: With appropriate HTTP error codes:
+        - 400: Invalid file extension or filename
+        - 403: Insufficient permissions
+        - 404: Destination path not found
+        - 409: File exists and overwrite is disabled
+    """
+    LOG.debug(f"Validating upload prerequisites for file: {file_name}")
+
+    # Check file extension restrictions
+    is_allowed, err_message = is_file_upload_allowed(file_name)
+    if not is_allowed:
+      LOG.warning(f"File upload rejected - {err_message}")
+      raise PopupException(err_message, error_code=400)
+
+    # Check if the destination path already exists or not
+    if not self._fs.exists(self.dest_path):
+      LOG.error(f"Destination path does not exist: {self.dest_path}")
+      raise PopupException(f"The destination path {self.dest_path} does not exist.", error_code=404)
+
+    # Check if the destination path is a directory or not
+    if not self._fs.isdir(self.dest_path):
+      LOG.error(f"Destination path is not a directory: {self.dest_path}")
+      raise PopupException(f"The destination path {self.dest_path} is not a directory.", error_code=400)
+
+    # Check if the file name contains a path separator
+    # This prevents directory traversal attacks
+    if os.path.sep in file_name:
+      LOG.warning(f"Invalid filename with path separator: {file_name}")
+      raise PopupException("Invalid filename. Path separators are not allowed.", error_code=400)
+
+    # Check if the user has write access to the destination path
+    try:
+      self._fs.check_access(self.dest_path, "rw-")
+    except WebHdfsException as e:
+      LOG.error(f"Error checking access to path {self.dest_path}: {e}")
+      raise PopupException(f"Insufficient permissions to write to path {self.dest_path}.", error_code=403)
+
+    # Check if the file already exists at the destination path
+    target_file_path = self._fs.join(self.dest_path, file_name)
+    if self._fs.exists(target_file_path):
+      if self.overwrite:
+        LOG.info(f"Overwriting existing file: {target_file_path}")
+        self._fs.remove(target_file_path, skip_trash=True)
+      else:
+        LOG.warning(f"File already exists and overwrite is disabled: {target_file_path}")
+        raise PopupException(f"The file {file_name} already exists at the destination path.", error_code=409)
+
+    LOG.debug("Upload prerequisites validation completed successfully")
+
+  def receive_data_chunk(self, raw_data, start):
+    self.total_bytes_received += len(raw_data)
+    max_size = MAX_FILE_SIZE_UPLOAD_LIMIT.get()
+
+    # Perform max size check on the fly
+    if max_size != -1 and max_size >= 0 and self.total_bytes_received > max_size:
+      LOG.error(f"File size exceeded limit - received: {self.total_bytes_received}, max: {max_size}")
+      raise PopupException(f"File exceeds maximum allowed size of {max_size} bytes.", error_code=413)
+
+    # Append the chunk directly to the destination file
+    try:
+      LOG.debug(
+        f"Appending chunk to HDFS file at {self.target_file_path} - size: {len(raw_data)} bytes, total: {self.total_bytes_received} bytes"
+      )
+      self._fs.append(self.target_file_path, raw_data)
+      return None
+    except Exception as e:
+      LOG.exception(f'Error appending data to file "{self.target_file_path}"')
+      try:  # Try to clean up the partial file
+        LOG.info(f"Attempting to clean up partial file at {self.target_file_path}")
+        self._fs.remove(self.target_file_path, skip_trash=True)
+      except Exception:
+        pass
+
+      raise PopupException(f"Failed to write upload data: {e}", error_code=500)
+
+  def file_complete(self, file_size):
+    # Get file stats
+    file_stats = self._fs.stats(self.target_file_path)
+
+    # Perform size verification explicitly
+    actual_size = file_stats.size
+    if actual_size != file_size:
+      LOG.error(f"HDFS upload size mismatch for {self.target_file_path}: expected {file_size} bytes, got {actual_size} bytes")
+
+      # Clean up the corrupted file
+      try:
+        self._fs.remove(self.target_file_path, skip_trash=True)
+        LOG.info(f"Successfully cleaned up corrupted file: {self.target_file_path}")
+      except Exception as cleanup_error:
+        LOG.warning(f"Failed to clean up corrupted file {self.target_file_path}: {cleanup_error}")
+
+      # Raise exception to fail the upload
+      raise PopupException(
+        f"Upload verification failed: expected {file_size} bytes, but only {actual_size} bytes were written. "
+        f"The incomplete file has been removed.",
+        error_code=422,
+      )
+    else:
+      LOG.info(f"Upload completed successfully for {self.target_file_path}, {file_size} bytes written")
+
+    file_stats = massage_stats(file_stats)
+    return file_stats

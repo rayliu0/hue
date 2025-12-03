@@ -17,20 +17,21 @@
 #
 from __future__ import division
 
-import re
-import sys
-import math
-import time
-import queue
 import base64
+import logging
+import math
+import queue
+import re
 import socket
 import struct
-import logging
+import sys
 import threading
+import time
 from builtins import map, object, range
 
 from django.conf import settings
-from past.builtins import basestring
+from django.utils.translation import gettext as _
+from past.builtins import basestring, long
 from thrift.protocol.TBinaryProtocol import TBinaryProtocol
 from thrift.protocol.TMultiplexedProtocol import TMultiplexedProtocol
 from thrift.Thrift import TApplicationException, TType
@@ -44,19 +45,13 @@ from desktop.lib.python_util import create_synchronous_io_multiplexer
 from desktop.lib.thrift_.http_client import THttpClient
 from desktop.lib.thrift_.TSSLSocketWithWildcardSAN import TSSLSocketWithWildcardSAN
 from desktop.lib.thrift_sasl import TSaslClientTransport
-
-if sys.version_info[0] > 2:
-  from django.utils.translation import gettext as _
-  from past.builtins import long
-else:
-  from django.utils.translation import ugettext as _
-
+from desktop.lib.tls_utils import create_thrift_ssl_context, get_ssl_protocol
 
 LOG = logging.getLogger()
 
 
 try:
-  import sasl
+  import sasl  # noqa: F401 - Imported for later use in sasl_factory
 except Exception as e:
   # Workaround potential version `GLIBCXX_3.4.26' not found
   LOG.warn('Could not import sasl: %s' % e)
@@ -315,17 +310,78 @@ def connect_to_thrift(conf):
     mode.set_verify(conf.validate)
   else:
     if conf.use_ssl:
-      try:
-        from ssl import PROTOCOL_TLS
-        PROTOCOL_SSLv23 = PROTOCOL_TLS
-      except ImportError:
+      # Get the optimal SSL protocol
+      ssl_protocol = get_ssl_protocol()
+
+      # Try to create SSL context for enhanced TLS 1.3 support
+      ssl_context = create_thrift_ssl_context(
+        validate=conf.validate,
+        ca_certs=conf.ca_certs,
+        keyfile=conf.keyfile,
+        certfile=conf.certfile
+      )
+
+      # Use SSL context if available, otherwise fall back to ssl_version parameter
+      if ssl_context:
         try:
-          from ssl import PROTOCOL_SSLv23 as PROTOCOL_TLS
+          # Check if TSSLSocketWithWildcardSAN supports ssl_context parameter
+          import inspect
+          if hasattr(TSSLSocketWithWildcardSAN, '__init__'):
+            sig = inspect.signature(TSSLSocketWithWildcardSAN.__init__)
+            if 'ssl_context' in sig.parameters:
+              mode = TSSLSocketWithWildcardSAN(
+                conf.host, conf.port,
+                validate=conf.validate,
+                ca_certs=conf.ca_certs,
+                keyfile=conf.keyfile,
+                certfile=conf.certfile,
+                ssl_context=ssl_context
+              )
+              LOG.debug("Using TSSLSocketWithWildcardSAN with SSL context")
+            else:
+              # Fall back to ssl_version parameter
+              mode = TSSLSocketWithWildcardSAN(
+                conf.host, conf.port,
+                validate=conf.validate,
+                ca_certs=conf.ca_certs,
+                keyfile=conf.keyfile,
+                certfile=conf.certfile,
+                ssl_version=ssl_protocol
+              )
+              LOG.debug("Using TSSLSocketWithWildcardSAN with ssl_version parameter")
+          else:
+            # Fallback for older versions
+            mode = TSSLSocketWithWildcardSAN(
+              conf.host, conf.port,
+              validate=conf.validate,
+              ca_certs=conf.ca_certs,
+              keyfile=conf.keyfile,
+              certfile=conf.certfile,
+              ssl_version=ssl_protocol
+            )
+        except Exception as e:
+          LOG.warning(f"Could not use SSL context for Thrift, falling back to ssl_version: {e}")
+          mode = TSSLSocketWithWildcardSAN(
+            conf.host, conf.port,
+            validate=conf.validate,
+            ca_certs=conf.ca_certs,
+            keyfile=conf.keyfile,
+            certfile=conf.certfile,
+            ssl_version=ssl_protocol
+          )
+      else:
+        # Fallback to the previous method if SSL context creation failed
+        try:
+          from ssl import PROTOCOL_TLS
           PROTOCOL_SSLv23 = PROTOCOL_TLS
         except ImportError:
-          PROTOCOL_SSLv23 = PROTOCOL_TLS = 2
-      mode = TSSLSocketWithWildcardSAN(conf.host, conf.port, validate=conf.validate, ca_certs=conf.ca_certs,
-                                       keyfile=conf.keyfile, certfile=conf.certfile, ssl_version=PROTOCOL_SSLv23)
+          try:
+            from ssl import PROTOCOL_SSLv23 as PROTOCOL_TLS
+            PROTOCOL_SSLv23 = PROTOCOL_TLS
+          except ImportError:
+            PROTOCOL_SSLv23 = PROTOCOL_TLS = 2
+        mode = TSSLSocketWithWildcardSAN(conf.host, conf.port, validate=conf.validate, ca_certs=conf.ca_certs,
+                                        keyfile=conf.keyfile, certfile=conf.certfile, ssl_version=PROTOCOL_SSLv23)
     else:
       mode = TSocket(conf.host, conf.port)
 
@@ -357,17 +413,34 @@ def connect_to_thrift(conf):
       mode.set_basic_auth(conf.username, conf.password)
 
   if conf.transport_mode == 'socket' and conf.use_sasl:
-    def sasl_factory():
-      saslc = sasl.Client()
-      saslc.setAttr("host", str(conf.host))
-      saslc.setAttr("service", str(conf.kerberos_principal))
-      if conf.mechanism == 'PLAIN':
-        saslc.setAttr("username", str(conf.username))
-        saslc.setAttr("password", str(conf.password))  # Defaults to 'hue' for a non-empty string unless using LDAP
-      else:
-        saslc.setAttr("maxbufsize", SASL_MAX_BUFFER.get())
-      saslc.init()
-      return saslc
+    try:
+      import sasl  # pylint: disable=import-error
+
+      def sasl_factory():
+        saslc = sasl.Client()
+        saslc.setAttr("host", str(conf.host))
+        saslc.setAttr("service", str(conf.kerberos_principal))
+        if conf.mechanism == 'PLAIN':
+          saslc.setAttr("username", str(conf.username))
+          saslc.setAttr("password", str(conf.password))  # Defaults to 'hue' for a non-empty string unless using LDAP
+        else:
+          saslc.setAttr("maxbufsize", SASL_MAX_BUFFER.get())
+        saslc.init()
+        return saslc
+
+    except Exception:
+      LOG.debug("Unable to import 'sasl'. Fallback to 'puresasl'.")
+      from desktop.lib.sasl_compat import PureSASLClient
+
+      def sasl_factory():
+        return PureSASLClient(
+          host=str(conf.host),
+          username=str(conf.username) if conf.mechanism == 'PLAIN' else None,
+          password=str(conf.password) if conf.mechanism == 'PLAIN' else None,
+          maxbufsize=SASL_MAX_BUFFER.get() if conf.mechanism != 'PLAIN' else None,
+          service=str(conf.kerberos_principal)
+        )
+
     transport = TSaslClientTransport(sasl_factory, conf.mechanism, mode)
   elif conf.transport == 'framed':
     transport = TFramedTransport(mode)
@@ -591,12 +664,8 @@ class SuperClient(object):
 
 def _unpack_guid_secret_in_handle(str_args):
   if 'operationHandle' in str_args or 'sessionHandle' in str_args:
-    if sys.version_info[0] > 2:
-      guid = re.search('guid=(b".*"), secret', str_args) or re.search('guid=(b\'.*\'), secret', str_args)
-      secret = re.search(r'secret=(b".+?")\)', str_args) or re.search('secret=(b\'.+?\')\\)', str_args)
-    else:
-      secret = re.search('secret=(".*"), guid', str_args) or re.search('secret=(\'.*\'), guid', str_args)
-      guid = re.search(r'guid=(".*")\)\)', str_args) or re.search('guid=(\'.*\')\\)\\)', str_args)
+    guid = re.search('guid=(b".*"), secret', str_args) or re.search('guid=(b\'.*\'), secret', str_args)
+    secret = re.search(r'secret=(b".+?")\)', str_args) or re.search('secret=(b\'.+?\')\\)', str_args)
 
     if secret and guid:
       try:
@@ -616,7 +685,7 @@ def unpack_guid(guid):
 
 
 def unpack_guid_base64(guid):
-  decoded_guid = base64.b64decode(guid) if sys.version_info[0] > 2 else base64.decodestring(guid)
+  decoded_guid = base64.b64decode(guid)
   return "%016x:%016x" % struct.unpack(b"QQ", decoded_guid)
 
 

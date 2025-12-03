@@ -107,7 +107,12 @@ class Command(BaseCommand):
       *args: Variable arguments.
       **options: Keyword arguments.
     """
-    ruff_package = paths.get_build_dir('env', 'bin', 'ruff')
+    PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+    if PYTHON_VERSION == "3.11":
+        ruff_package = paths.get_build_dir('env', 'bin', 'ruff')
+    else:
+        ruff_package = paths.get_build_dir('venvs', f'python{PYTHON_VERSION}', 'bin', 'ruff')
 
     if not os.path.exists(ruff_package):
       msg = _(
@@ -131,6 +136,5 @@ class Command(BaseCommand):
       ret = subprocess.run(ruff_cmd, check=True)
       if ret.returncode != 0:
         sys.exit(1)
-    except subprocess.CalledProcessError as e:
-      LOG.debug(f"Ruff command: {e}")
+    except subprocess.CalledProcessError:
       sys.exit(1)

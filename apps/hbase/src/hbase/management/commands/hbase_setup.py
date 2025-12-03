@@ -17,22 +17,14 @@
 
 import logging
 import os
-import sys
-
 from datetime import datetime, timedelta
 
 from django.core.management.base import BaseCommand
+from hbased.ttypes import AlreadyExists
 
 from desktop.lib.paths import get_apps_root
-from useradmin.models import install_sample_user, User
-
-from hbased.ttypes import AlreadyExists
 from hbase.api import HbaseApi
-
-if sys.version_info[0] > 2:
-  from django.utils.translation import gettext as _
-else:
-  from django.utils.translation import ugettext as _
+from useradmin.models import install_sample_user
 
 LOG = logging.getLogger()
 
@@ -50,7 +42,7 @@ class Command(BaseCommand):
       user = install_sample_user()
 
     api = HbaseApi(user=user)
-    cluster_name = api.getClusters()[0]['name'] # Currently pick first configured cluster
+    cluster_name = api.getClusters()[0]['name']  # Currently pick first configured cluster
 
     # Check connectivity
     api.connectCluster(cluster_name)
@@ -61,10 +53,9 @@ class Command(BaseCommand):
     self.create_binary_table(api, cluster_name)
     self.load_binary_table(api, cluster_name)
 
-
   def create_analytics_table(self, api, cluster_name):
     try:
-      api.createTable(cluster_name, 'analytics_demo', [{'properties': {'name': 'hour'}}, {'properties': {'name': 'day'}}, {'properties': {'name': 'total'}}])
+      api.createTable(cluster_name, 'analytics_demo', [{'properties': {'name': 'hour'}}, {'properties': {'name': 'day'}}, {'properties': {'name': 'total'}}])  # noqa: E501
     except AlreadyExists:
       pass
 
@@ -90,5 +81,5 @@ class Command(BaseCommand):
     root = os.path.join(get_apps_root(), 'hbase', 'example', 'documents')
 
     api.putRow(cluster_name, 'document_demo', today, {'doc:img': open(root + '/hue-logo.png', "rb").read()})
-    api.putRow(cluster_name, 'document_demo', today, {'doc:html': open(root + '/gethue.com.html', "rb").read()})
+    api.putRow(cluster_name, 'document_demo', today, {'doc:html': open(root + '/example-page.html', "rb").read()})
     api.putRow(cluster_name, 'document_demo', today, {'doc:pdf': open(root + '/gethue.pdf', "rb").read()})

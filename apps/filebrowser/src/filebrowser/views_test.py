@@ -15,37 +15,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import logging
 import os
 import re
-import json
 import stat
-import logging
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from io import BytesIO
 from time import sleep, time
 from unittest.mock import Mock, patch
 from urllib.parse import unquote as urllib_unquote
 
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from avro import datafile, io, schema
 from django.http import HttpResponse
 from django.test import TestCase
 from django.urls import reverse
-from django.utils.translation import gettext_lazy as _
 
 from aws.conf import AWS_ACCOUNTS
-from aws.s3.s3fs import S3FileSystemException
 from aws.s3.s3test_utils import get_test_bucket
 from azure.conf import ABFS_CLUSTERS, is_abfs_enabled, is_adls_enabled
-from desktop.conf import OZONE, RAZ, is_ofs_enabled, is_oozie_enabled
+from desktop.conf import is_ofs_enabled, is_oozie_enabled, OZONE, RAZ, USE_STORAGE_CONNECTORS
 from desktop.lib.django_test_util import make_logged_in_client
+from desktop.lib.exceptions_renderable import PopupException
 from desktop.lib.test_utils import add_permission, add_to_group, grant_access, remove_from_group
 from desktop.lib.view_util import location_to_url
-from filebrowser.conf import ENABLE_EXTRACT_UPLOADED_ARCHIVE, MAX_SNAPPY_DECOMPRESSION_SIZE, REMOTE_STORAGE_HOME
+from filebrowser.conf import (
+  ALLOW_FILE_EXTENSIONS,
+  ENABLE_EXTRACT_UPLOADED_ARCHIVE,
+  MAX_SNAPPY_DECOMPRESSION_SIZE,
+  REMOTE_STORAGE_HOME,
+  RESTRICT_FILE_EXTENSIONS,
+)
 from filebrowser.lib.rwx import expand_mode
-from filebrowser.views import _normalize_path, snappy_installed
+from filebrowser.views import _normalize_path, _read_parquet, _validate_file_extension_allowed, snappy_installed
 from hadoop import pseudo_hdfs4
 from hadoop.conf import UPLOAD_CHUNK_SIZE
 from hadoop.fs.webhdfs import WebHdfs
@@ -78,7 +87,9 @@ class TestFileBrowser:
     grant_access(self.user.username, 'test_filebrowser', 'filebrowser')
     add_to_group(self.user.username, 'test_filebrowser')
 
-  def test_listdir_paged(self):
+  @patch('json.dumps')
+  def test_listdir_paged(self, mock_json_dumps):
+    mock_json_dumps.return_value = '{}'
     with patch('desktop.middleware.fsmanager.get_filesystem') as get_filesystem:
       with patch('filebrowser.views.snappy_installed') as snappy_installed:
         snappy_installed.return_value = False
@@ -253,6 +264,229 @@ class TestFileBrowser:
           b'"url": "/filebrowser/view=%2Fuser%2Fsystest%2Ftest5%2FT%D0%B6%D0%B5%'
           b'D0%B9%D0%BA%D0%BE%D0%B1%2Femploy%C3%A9s_file.txt",' in response.content
         ), response.content
+
+
+class TestFileExtensionRestrictions:
+  """Test file extension restrictions for filebrowser rename and touch APIs validation logic."""
+
+  # Tests for rename operation validation logic
+  def test_rename_without_extension_change(self):
+    """Test rename validation when extension doesn't change - should pass regardless of restrictions."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing([".txt"])
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing(None)
+
+    try:
+      src_path = '/user/test/document.txt'
+      dest_path = '/user/test/document_renamed.txt'
+
+      # Extract extensions (same logic as smart_rename)
+      _, source_ext = os.path.splitext(src_path)
+      dest_filename = os.path.basename(dest_path)
+      _, dest_ext = os.path.splitext(dest_filename)
+
+      # Validation: only check if extension changes
+      if source_ext.lower() != dest_ext.lower():
+        _validate_file_extension_allowed(dest_filename)
+
+      # Should pass - extensions are the same
+      assert source_ext.lower() == dest_ext.lower()
+    finally:
+      reset_allow()
+      reset_restrict()
+
+  def test_rename_with_extension_change_to_restricted(self):
+    """Test rename validation with change to restricted extension - should fail."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing(None)
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing([".exe", ".bat", ".cmd"])
+
+    try:
+      src_path = '/user/test/script.txt'
+      dest_path = '/user/test/script.exe'
+
+      # Extract extensions (same logic as smart_rename)
+      _, source_ext = os.path.splitext(src_path)
+      dest_filename = os.path.basename(dest_path)
+      _, dest_ext = os.path.splitext(dest_filename)
+
+      # Validation: only check if extension changes
+      if source_ext.lower() != dest_ext.lower():
+        with pytest.raises(PopupException) as exc_info:
+          _validate_file_extension_allowed(dest_filename)
+        assert "is restricted" in str(exc_info.value)
+      else:
+        pytest.fail("Extensions should be different in this test")
+    finally:
+      reset_allow()
+      reset_restrict()
+
+  def test_rename_with_extension_change_to_allowed(self):
+    """Test rename validation with change to allowed extension - should pass."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing([".txt", ".csv", ".json"])
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing(None)
+
+    try:
+      src_path = '/user/test/data.txt'
+      dest_path = '/user/test/data.csv'
+
+      # Extract extensions (same logic as smart_rename)
+      _, source_ext = os.path.splitext(src_path)
+      dest_filename = os.path.basename(dest_path)
+      _, dest_ext = os.path.splitext(dest_filename)
+
+      # Validation: only check if extension changes
+      if source_ext.lower() != dest_ext.lower():
+        _validate_file_extension_allowed(dest_filename)  # Should not raise
+
+      # Should pass - .csv is in allow list
+      assert source_ext.lower() != dest_ext.lower()
+    finally:
+      reset_allow()
+      reset_restrict()
+
+  def test_rename_with_extension_change_to_not_allowed(self):
+    """Test rename validation with change to non-allowed extension - should fail."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing([".txt", ".csv"])
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing(None)
+
+    try:
+      src_path = '/user/test/data.txt'
+      dest_path = '/user/test/data.xml'
+
+      # Extract extensions (same logic as smart_rename)
+      _, source_ext = os.path.splitext(src_path)
+      dest_filename = os.path.basename(dest_path)
+      _, dest_ext = os.path.splitext(dest_filename)
+
+      # Validation: only check if extension changes
+      if source_ext.lower() != dest_ext.lower():
+        with pytest.raises(PopupException) as exc_info:
+          _validate_file_extension_allowed(dest_filename)
+        assert "is not permitted" in str(exc_info.value)
+      else:
+        pytest.fail("Extensions should be different in this test")
+    finally:
+      reset_allow()
+      reset_restrict()
+
+  def test_rename_case_insensitive_extension_check(self):
+    """Test that extension comparison is case-insensitive."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing([".txt"])
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing(None)
+
+    try:
+      src_path = '/user/test/document.TXT'
+      dest_path = '/user/test/document_renamed.txt'
+
+      # Extract extensions (same logic as smart_rename)
+      _, source_ext = os.path.splitext(src_path)
+      dest_filename = os.path.basename(dest_path)
+      _, dest_ext = os.path.splitext(dest_filename)
+
+      # Validation: only check if extension changes
+      if source_ext.lower() != dest_ext.lower():
+        _validate_file_extension_allowed(dest_filename)
+
+      # Should pass - extensions are same (case-insensitive: .TXT == .txt)
+      assert source_ext.lower() == dest_ext.lower()
+    finally:
+      reset_allow()
+      reset_restrict()
+
+  def test_rename_directory_not_affected(self):
+    """Test that renaming directories is not affected by file extension restrictions."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing([".txt"])
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing(None)
+
+    try:
+      src_path = '/user/test/old_folder'
+      dest_path = '/user/test/new_folder'
+
+      # Extract extensions (same logic as smart_rename)
+      _, source_ext = os.path.splitext(src_path)
+      dest_filename = os.path.basename(dest_path)
+      _, dest_ext = os.path.splitext(dest_filename)
+
+      # Validation: only check if extension changes
+      if source_ext.lower() != dest_ext.lower():
+        _validate_file_extension_allowed(dest_filename)
+
+      # Should pass - directories have no extensions, so extensions are same (both empty)
+      assert source_ext == dest_ext == ''
+    finally:
+      reset_allow()
+      reset_restrict()
+
+  # Tests for touch (create file) operation
+  def test_touch_with_allowed_extension(self):
+    """Test creating file with allowed extension - should pass validation."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing([".txt", ".csv", ".json"])
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing(None)
+
+    try:
+      name = 'newfile.txt'
+      # Should not raise exception
+      _validate_file_extension_allowed(name)
+    finally:
+      reset_allow()
+      reset_restrict()
+
+  def test_touch_with_restricted_extension(self):
+    """Test creating file with restricted extension - should fail validation."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing(None)
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing([".exe", ".bat", ".cmd"])
+
+    try:
+      name = 'malicious.exe'
+      # Should raise PopupException
+      with pytest.raises(PopupException) as exc_info:
+        _validate_file_extension_allowed(name)
+      assert "is restricted" in str(exc_info.value)
+    finally:
+      reset_allow()
+      reset_restrict()
+
+  def test_touch_with_not_allowed_extension(self):
+    """Test creating file with non-allowed extension when allow list configured - should fail validation."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing([".txt", ".csv"])
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing(None)
+
+    try:
+      name = 'data.xml'
+      # Should raise PopupException
+      with pytest.raises(PopupException) as exc_info:
+        _validate_file_extension_allowed(name)
+      assert "is not permitted" in str(exc_info.value)
+    finally:
+      reset_allow()
+      reset_restrict()
+
+  def test_touch_without_extension(self):
+    """Test creating file without extension - should pass when no restrictions."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing(None)
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing([".exe"])
+
+    try:
+      name = 'README'
+      # Should not raise exception
+      _validate_file_extension_allowed(name)
+    finally:
+      reset_allow()
+      reset_restrict()
+
+  def test_touch_both_allow_and_restrict_lists(self):
+    """Test that restrict list takes precedence when both lists are configured."""
+    reset_allow = ALLOW_FILE_EXTENSIONS.set_for_testing([".txt", ".exe"])
+    reset_restrict = RESTRICT_FILE_EXTENSIONS.set_for_testing([".exe", ".bat"])
+
+    try:
+      name = 'program.exe'
+      # Should raise PopupException (restrict takes precedence)
+      with pytest.raises(PopupException) as exc_info:
+        _validate_file_extension_allowed(name)
+      assert "is restricted" in str(exc_info.value)
+    finally:
+      reset_allow()
+      reset_restrict()
 
 
 @pytest.mark.requires_hadoop
@@ -459,13 +693,13 @@ class TestFileBrowserWithHadoop(object):
     kwargs.update(permissions_dict)
 
     # Set 1777, then check permissions of dirs
-    response = self.c.post("/filebrowser/chmod", kwargs)
+    self.c.post("/filebrowser/chmod", kwargs)
     assert 0o41777 == int(self.cluster.fs.stats(PATH)["mode"])
 
     # Now do the above recursively
     assert 0o41777 != int(self.cluster.fs.stats(SUBPATH)["mode"])
     kwargs['recursive'] = True
-    response = self.c.post("/filebrowser/chmod", kwargs)
+    self.c.post("/filebrowser/chmod", kwargs)
     assert 0o41777 == int(self.cluster.fs.stats(SUBPATH)["mode"])
 
     # Test bulk chmod
@@ -509,13 +743,13 @@ class TestFileBrowserWithHadoop(object):
     kwargs.update(permissions_dict)
 
     # Set sticky bit, then check sticky bit is on in hdfs
-    response = self.c.post("/filebrowser/chmod", kwargs)
+    self.c.post("/filebrowser/chmod", kwargs)
     mode = expand_mode(int(self.cluster.fs.stats(PATH)["mode"]))
     assert True is mode[-1]
 
     # Unset sticky bit, then check sticky bit is off in hdfs
     del kwargs['sticky']
-    response = self.c.post("/filebrowser/chmod", kwargs)
+    self.c.post("/filebrowser/chmod", kwargs)
     mode = expand_mode(int(self.cluster.fs.stats(PATH)["mode"]))
     assert False is mode[-1]
 
@@ -567,7 +801,6 @@ class TestFileBrowserWithHadoop(object):
     NAME = "test-rename-before"
     NEW_NAME = "test-rename-after"
     self.cluster.fs.mkdir(PREFIX + NAME)
-    op = "rename"
     # test for full path rename
     self.c.post("/filebrowser/rename", dict(src_path=PREFIX + NAME, dest_path=PREFIX + NEW_NAME))
     assert self.cluster.fs.exists(PREFIX + NEW_NAME)
@@ -769,7 +1002,6 @@ class TestFileBrowserWithHadoop(object):
   def test_view_snappy_compressed_avro(self):
     if not snappy_installed():
       pytest.skip("Skipping Test")
-    import snappy
 
     finish = []
     try:
@@ -1499,7 +1731,8 @@ class TestADLSAccessPermissions(object):
     assert 500 == response.status_code
 
     # 500 for real currently
-    assert_raises(IOError, self.client.get, '/filebrowser/edit=ADL://hue-test-01')
+    with pytest.raises(IOError):
+      self.client.get('/filebrowser/edit=ADL://hue-test-01')
 
     # 500 for real currently
 
@@ -1708,7 +1941,11 @@ class TestFileChooserRedirect(object):
           reset()
 
       # S3A - default_s3_home
-      resets = [REMOTE_STORAGE_HOME.set_for_testing(None), AWS_ACCOUNTS.set_for_testing({'default': {'default_home_path': None}})]
+      resets = [
+        REMOTE_STORAGE_HOME.set_for_testing(None),
+        USE_STORAGE_CONNECTORS.set_for_testing(False),
+        AWS_ACCOUNTS.set_for_testing({"default": {"default_home_path": None}}),
+      ]
       try:
         response = self.client.get('/filebrowser/view=%2F?default_s3_home')
 
@@ -1720,6 +1957,7 @@ class TestFileChooserRedirect(object):
 
       resets = [
         REMOTE_STORAGE_HOME.set_for_testing(None),
+        USE_STORAGE_CONNECTORS.set_for_testing(False),
         AWS_ACCOUNTS.set_for_testing({'default': {'default_home_path': 's3a://my_bucket'}}),
       ]
       try:
@@ -1733,6 +1971,7 @@ class TestFileChooserRedirect(object):
       resets = [
         RAZ.IS_ENABLED.set_for_testing(True),
         REMOTE_STORAGE_HOME.set_for_testing(None),
+        USE_STORAGE_CONNECTORS.set_for_testing(False),
         AWS_ACCOUNTS.set_for_testing({'default': {'default_home_path': 's3a://my_bucket'}}),
       ]
       try:
@@ -1747,6 +1986,7 @@ class TestFileChooserRedirect(object):
       resets = [
         RAZ.IS_ENABLED.set_for_testing(True),
         REMOTE_STORAGE_HOME.set_for_testing(None),
+        USE_STORAGE_CONNECTORS.set_for_testing(False),
         AWS_ACCOUNTS.set_for_testing({'default': {'default_home_path': 's3a://my_bucket/user'}}),
       ]
       try:
@@ -1765,7 +2005,7 @@ class TestFileChooserRedirect(object):
           stats.isDir.return_value = True
           listdir_paged.return_value = HttpResponse()
 
-          response = self.client.get('/filebrowser/view=')
+          self.client.get('/filebrowser/view=')
 
           _normalize_path.assert_called_with('/')
 
@@ -1825,3 +2065,40 @@ class TestNormalizePath(object):
 
     normalized = _normalize_path(path)
     assert path == normalized
+
+
+class TestReadParquet:
+  def setup_method(self):
+    # Setup a common DataFrame and create a Parquet file in memory
+    self.test_df = pd.DataFrame({
+        'column1': [1, 2, 3, 4, 5],
+        'column2': ['a', 'b', 'c', 'd', 'e']
+    })
+    self.file_data = self.create_parquet_file(self.test_df)
+    self.path = "/mock/path/to/file.parquet"
+    self.offset = 0
+    self.length = 3
+    self.stats = None
+
+  def create_parquet_file(self, dataframe):
+    # Helper method to create a Parquet file in memory
+    buffer = BytesIO()
+    table = pa.Table.from_pandas(dataframe)
+    pq.write_table(table, buffer)
+    buffer.seek(0)  # Reset the file handle position
+    return buffer
+
+  def test_read_parquet_success(self):
+    # Call the function with valid Parquet data
+    result = _read_parquet(self.file_data, self.path, self.offset, self.length, self.stats)
+
+    expected_chunk = self.test_df.iloc[self.offset:self.offset + self.length].to_string()
+
+    assert result == expected_chunk
+
+  def test_read_parquet_invalid_file(self):
+    # Create an invalid file (not a Parquet file)
+    invalid_file_data = BytesIO(b"Not a valid Parquet file")
+
+    with pytest.raises(Exception, match="Failed to read Parquet file"):
+      _read_parquet(invalid_file_data, self.path, self.offset, self.length, self.stats)

@@ -15,43 +15,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import re
-import sys
-import stat as stat_module
 import errno
+import json
 import logging
-import operator
 import mimetypes
+import operator
+import os
 import posixpath
-import urllib.error
-import urllib.request
-from builtins import object
+import re
+import stat as stat_module
+from builtins import str as new_str
 from bz2 import decompress
 from datetime import datetime
 from functools import partial
+from gzip import decompress as decompress_gzip
+from io import BytesIO, StringIO as string_io
+from urllib.parse import quote as urllib_quote, unquote as urllib_unquote, urlparse as lib_urlparse
 
-from django.core.files.uploadhandler import FileUploadHandler, StopFutureHandlers, StopUpload
-from django.core.paginator import EmptyPage, InvalidPage, Page, Paginator
-from django.http import Http404, HttpResponse, HttpResponseForbidden, HttpResponseNotModified, HttpResponseRedirect, StreamingHttpResponse
+import pandas as pd
+from avro import datafile, io as avro_io
+from django.core.files.uploadhandler import StopUpload
+from django.core.paginator import EmptyPage, InvalidPage, Paginator
+from django.http import Http404, HttpResponse, HttpResponseNotModified, HttpResponseRedirect, StreamingHttpResponse
 from django.shortcuts import redirect
 from django.template.defaultfilters import filesizeformat, stringformat
 from django.urls import reverse
 from django.utils.html import escape
 from django.utils.http import http_date
-from django.views.decorators.csrf import csrf_exempt
+from django.utils.translation import gettext as _
 from django.views.decorators.http import require_http_methods
 from django.views.static import was_modified_since
 
-from aws.s3.s3fs import S3FileSystemException, S3ListAllBucketsException, get_s3_home_directory
+from aws.s3.s3fs import S3FileSystemException, S3ListAllBucketsException
 from aws.s3.upload import S3FineUploaderChunkedUpload
 from azure.abfs.upload import ABFSFineUploaderChunkedUpload
 from desktop import appmanager
 from desktop.auth.backend import is_admin
-from desktop.conf import ENABLE_NEW_STORAGE_BROWSER, RAZ, TASK_SERVER_V2
-from desktop.lib import fsmanager, i18n
+from desktop.conf import RAZ, TASK_SERVER_V2, USE_STORAGE_CONNECTORS
+from desktop.lib import i18n
 from desktop.lib.conf import coerce_bool
-from desktop.lib.django_util import JsonResponse, format_preserving_redirect, render
+from desktop.lib.django_util import format_preserving_redirect, JsonResponse, render
 from desktop.lib.exceptions_renderable import PopupException
 from desktop.lib.export_csvxls import file_reader
 from desktop.lib.fs import splitpath
@@ -86,41 +89,16 @@ from filebrowser.forms import (
   SetReplicationFactorForm,
   TouchForm,
   TrashPurgeForm,
-  UploadArchiveForm,
   UploadFileForm,
 )
 from filebrowser.lib import xxd
-from filebrowser.lib.archives import archive_factory
 from filebrowser.lib.rwx import filetype, rwx
-from hadoop.conf import UPLOAD_CHUNK_SIZE
+from filebrowser.utils import is_file_upload_allowed
 from hadoop.core_site import get_trash_interval
 from hadoop.fs.exceptions import WebHdfsException
 from hadoop.fs.fsutils import do_overwrite_save
-from hadoop.fs.hadoopfs import Hdfs
 from hadoop.fs.upload import HDFSFineUploaderChunkedUpload, LocalFineUploaderChunkedUpload
 from useradmin.models import Group, User
-
-if sys.version_info[0] > 2:
-  import io
-  from builtins import str as new_str
-  from gzip import decompress as decompress_gzip
-  from io import StringIO as string_io
-  from urllib.parse import quote as urllib_quote, unquote as urllib_unquote, urlparse as lib_urlparse
-
-  from avro import datafile, io
-  from django.utils.translation import gettext as _
-else:
-  from urllib import quote as urllib_quote, unquote as urllib_unquote
-
-  from cStringIO import StringIO as string_io
-  from urlparse import urlparse as lib_urlparse
-  new_str = unicode
-  from gzip import GzipFile
-
-  import parquet
-  from avro import datafile, io
-  from django.utils.translation import ugettext as _
-
 
 DEFAULT_CHUNK_SIZE_BYTES = 1024 * 4  # 4KB
 MAX_CHUNK_SIZE_BYTES = 1024 * 1024  # 1MB
@@ -132,6 +110,9 @@ BYTES_PER_SENTENCE = 2
 
 # The maximum size the file editor will allow you to edit
 MAX_FILEEDITOR_SIZE = 256 * 1024
+
+# Parquet files start with a specific 4-byte magic number: 'PAR1'
+PARQUET_MAGIC_NUMBER = b'PAR1'
 
 INLINE_DISPLAY_MIMETYPE = re.compile(
     r'video/|image/|audio/|application/pdf|application/msword|application/excel|application/vnd\.ms|application/vnd\.openxmlformats'
@@ -156,18 +137,10 @@ UPLOAD_CLASSES = {
     'local': LocalFineUploaderChunkedUpload,
 }
 
-if hasattr(ARCHIVE_UPLOAD_TEMPDIR, 'get') and not os.path.exists(ARCHIVE_UPLOAD_TEMPDIR.get()):
-  os.makedirs(ARCHIVE_UPLOAD_TEMPDIR.get())
+if hasattr(ARCHIVE_UPLOAD_TEMPDIR, 'get'):
+  os.makedirs(ARCHIVE_UPLOAD_TEMPDIR.get(), exist_ok=True)
 
 logger = logging.getLogger()
-
-
-class ParquetOptions(object):
-  def __init__(self, col=None, format='json', no_headers=True, limit=-1):
-    self.col = col
-    self.format = format
-    self.no_headers = no_headers
-    self.limit = limit
 
 
 def index(request):
@@ -187,9 +160,13 @@ def _decode_slashes(path):
   # This is a fix for some installations where the path is still having the slash (/) encoded
   # as %2F while the rest of the path is actually decoded.
   encoded_slash = '%2F'
-  if path and path.startswith(encoded_slash) or path.startswith('abfs:' + encoded_slash) or \
-    path.startswith('s3a:' + encoded_slash) or path.startswith('gs:' + encoded_slash) or \
-    path.startswith('ofs:' + encoded_slash):
+  if path and (
+    path.startswith(encoded_slash)
+    or path.startswith('abfs:' + encoded_slash)
+    or path.startswith('s3a:' + encoded_slash)
+    or path.startswith('gs:' + encoded_slash)
+    or path.startswith('ofs:' + encoded_slash)
+  ):
     path = path.replace(encoded_slash, '/')
 
   return path
@@ -234,8 +211,7 @@ def download(request, path):
   content_type = mimetypes.guess_type(path)[0] or 'application/octet-stream'
   stats = request.fs.stats(path)
   mtime = stats['mtime']
-  size = stats['size']
-  if not was_modified_since(request.META.get('HTTP_IF_MODIFIED_SINCE'), mtime, size):
+  if not was_modified_since(request.META.get('HTTP_IF_MODIFIED_SINCE'), mtime):
     return HttpResponseNotModified()
     # TODO(philip): Ideally a with statement would protect from leaks, but tricky to do here.
   fh = request.fs.open(path)
@@ -293,6 +269,11 @@ def view(request, path):
       )
 
   if 'default_s3_home' in request.GET:
+    if USE_STORAGE_CONNECTORS.get():
+      from desktop.lib.fs.s3.conf_utils import get_s3_home_directory
+    else:
+      from aws.s3.s3fs import get_s3_home_directory
+
     home_dir_path = get_s3_home_directory(request.user)
     if request.fs.isdir(home_dir_path):
       return format_preserving_redirect(
@@ -686,8 +667,8 @@ def listdir_paged(request, path):
       's3_listing_not_allowed': s3_listing_not_allowed
   }
 
-  if ENABLE_NEW_STORAGE_BROWSER.get():
-    return render('storage_browser.mako', request, data)
+  options_json = json.dumps(data)
+  data['options_json'] = options_json
   return render('listdir.mako', request, data)
 
 
@@ -825,24 +806,17 @@ def display(request, path):
   # Get contents as string for text mode, or at least try
   uni_contents = None
   if not mode or mode == 'text':
-    if sys.version_info[0] > 2:
-      if not isinstance(contents, str):
-        uni_contents = new_str(contents, encoding, errors='replace')
-        is_binary = uni_contents.find(i18n.REPLACEMENT_CHAR) != -1
-        # Auto-detect mode
-        if not mode:
-          mode = is_binary and 'binary' or 'text'
-      else:
-        # We already have a string.
-        uni_contents = contents
-        is_binary = False
-        mode = 'text'
-    else:
+    if not isinstance(contents, str):
       uni_contents = new_str(contents, encoding, errors='replace')
       is_binary = uni_contents.find(i18n.REPLACEMENT_CHAR) != -1
       # Auto-detect mode
       if not mode:
         mode = is_binary and 'binary' or 'text'
+    else:
+      # We already have a string.
+      uni_contents = contents
+      is_binary = False
+      mode = 'text'
 
   # Get contents as bytes
   if mode == "binary":
@@ -880,7 +854,7 @@ def display(request, path):
 
   data['breadcrumbs'] = parse_breadcrumbs(path)
   data['show_download_button'] = SHOW_DOWNLOAD_BUTTON.get()
-
+  data['options_json'] = json.dumps(data)
   return render("display.mako", request, data)
 
 
@@ -977,7 +951,7 @@ def _read_avro(fhandle, path, offset, length, stats):
   contents = ''
   try:
     fhandle.seek(offset)
-    data_file_reader = datafile.DataFileReader(fhandle, io.DatumReader())
+    data_file_reader = datafile.DataFileReader(fhandle, avro_io.DatumReader())
 
     try:
       contents_list = []
@@ -1002,13 +976,16 @@ def _read_avro(fhandle, path, offset, length, stats):
 
 def _read_parquet(fhandle, path, offset, length, stats):
   try:
-    size = 1 * 128 * 1024 * 1024  # Buffer file stream to 128 MB chunks
-    data = string_io(fhandle.read(size))
+    size = 1 * 128 * 1024 * 1024  # Buffer file stream to 128 MiB chunks
 
-    dumped_data = string_io()
-    parquet._dump(data, ParquetOptions(limit=1000), out=dumped_data)
-    dumped_data.seek(offset)
-    return dumped_data.read()
+    fhandle.seek(offset)
+    file_data = BytesIO(fhandle.read(size))
+
+    data_frame = pd.read_parquet(file_data, engine='pyarrow')
+
+    data_chunk = data_frame.iloc[offset:offset + length].to_string()
+
+    return data_chunk
   except Exception as e:
     logging.exception('Could not read parquet file at "%s": %s' % (path, e))
     raise PopupException(_("Failed to read Parquet file."))
@@ -1019,10 +996,7 @@ def _read_gzip(fhandle, path, offset, length, stats):
   if offset and offset != 0:
     raise PopupException(_("Offsets are not supported with Gzip compression."))
   try:
-    if sys.version_info[0] > 2:
-      contents = decompress_gzip(fhandle.read())
-    else:
-      contents = GzipFile('', 'r', 0, string_io(fhandle.read())).read(length)
+    contents = decompress_gzip(fhandle.read())
   except Exception as e:
     logging.exception('Could not decompress file at "%s": %s' % (path, e))
     raise PopupException(_("Failed to decompress file."))
@@ -1052,27 +1026,18 @@ def _read_simple(fhandle, path, offset, length, stats):
 
 def detect_gzip(contents):
   '''This is a silly small function which checks to see if the file is Gzip'''
-  if sys.version_info[0] > 2:
-    return contents[:2] == b'\x1f\x8b'
-  else:
-    return contents[:2] == '\x1f\x8b'
+  return contents[:2] == b'\x1f\x8b'
 
 
 def detect_bz2(contents):
   '''This is a silly small function which checks to see if the file is Bz2'''
-  if sys.version_info[0] > 2:
-    return contents[:3] == b'BZh'
-  else:
-    return contents[:3] == 'BZh'
+  return contents[:3] == b'BZh'
 
 
 def detect_avro(contents):
   '''This is a silly small function which checks to see if the file is Avro'''
   # Check if the first three bytes are 'O', 'b' and 'j'
-  if sys.version_info[0] > 2:
-    return contents[:3] == b'\x4F\x62\x6A'
-  else:
-    return contents[:3] == '\x4F\x62\x6A'
+  return contents[:3] == b'\x4F\x62\x6A'
 
 
 def detect_snappy(contents):
@@ -1092,19 +1057,22 @@ def detect_snappy(contents):
 def detect_parquet(fhandle):
   """
   Detect parquet from magic header bytes.
-  Python 2 only currently.
   """
-  return False if sys.version_info[0] > 2 else parquet._check_header_magic_bytes(fhandle)
+
+  fhandle.seek(0)
+  magic_number = fhandle.read(4)
+
+  return magic_number == PARQUET_MAGIC_NUMBER
 
 
 def snappy_installed():
   '''Snappy is library that isn't supported by python2.4'''
   try:
-    import snappy
+    import snappy  # noqa: F401
     return True
   except ImportError:
     return False
-  except Exception as e:
+  except Exception:
     logging.exception('failed to verify if snappy is installed')
     return False
 
@@ -1150,12 +1118,12 @@ def formset_initial_value_extractor(request, parameter_names):
   The formsets should then handle construction on their own.
   """
   def _intial_value_extractor(request):
-    if not submitted:
+    if not submitted:  # noqa: F821
       return []
     # Build data with list of in order parameters receive in POST data
     # Size can be inferred from largest list returned in POST data
     data = []
-    for param in submitted:
+    for param in submitted:  # noqa: F821
       i = 0
       for val in request.POST.getlist(param):
         if len(data) == i:
@@ -1164,7 +1132,7 @@ def formset_initial_value_extractor(request, parameter_names):
         i += 1
     # Extend every data object with recurring params
     for kwargs in data:
-      for recurrent in recurring:
+      for recurrent in recurring:  # noqa: F821
         kwargs[recurrent] = request.POST.get(recurrent)
     initial_data = data
     return {'initial': initial_data}
@@ -1258,6 +1226,11 @@ def generic_op(form_class, request, op, parameter_names, piggyback=None, templat
       args = arg_extractor(request, form, parameter_names)
       try:
         op(*args)
+      except PopupException as e:
+        if is_ajax(request):
+          return JsonResponse({'detail': str(e)}, status=500)
+        else:
+          raise
       except (IOError, WebHdfsException) as e:
         msg = _("Cannot perform operation.")
         raise PopupException(msg, detail=e)
@@ -1282,7 +1255,7 @@ def generic_op(form_class, request, op, parameter_names, piggyback=None, templat
         if piggyback:
           piggy_path = form.cleaned_data.get(piggyback)
           ret["result"] = _massage_stats(request, stat_absolute_path(piggy_path, request.fs.stats(piggy_path)))
-      except Exception as e:
+      except Exception:
         # Hard to report these more naturally here.  These happen either
         # because of a bug in the piggy-back code or because of a
         # race condition.
@@ -1302,6 +1275,24 @@ def generic_op(form_class, request, op, parameter_names, piggyback=None, templat
   return render(template, request, ret)
 
 
+def _validate_file_extension_allowed(filename):
+  """
+  Validate that a file's extension is allowed based on configured restrictions.
+
+  Args:
+    filename: The filename to validate
+
+  Raises:
+    PopupException: If the file extension is not allowed
+
+  Returns:
+    None if validation passes
+  """
+  is_allowed, error_message = is_file_upload_allowed(filename)
+  if not is_allowed:
+    raise PopupException(error_message)
+
+
 def rename(request):
   def smart_rename(src_path, dest_path):
     """If dest_path doesn't have a directory specified, use same dir."""
@@ -1310,6 +1301,16 @@ def rename(request):
     if "/" not in dest_path:
       src_dir = os.path.dirname(src_path)
       dest_path = request.fs.join(src_dir, dest_path)
+
+    # Extract file extensions from source and destination paths
+    _, source_ext = os.path.splitext(src_path)
+    dest_filename = os.path.basename(dest_path)
+    _, dest_ext = os.path.splitext(dest_filename)
+
+    # Check if extension is changing and validate if allowed
+    if source_ext.lower() != dest_ext.lower():
+      _validate_file_extension_allowed(dest_filename)
+
     if request.fs.exists(dest_path):
       raise PopupException(_('The destination path "%s" already exists.') % dest_path)
     request.fs.rename(src_path, dest_path)
@@ -1343,6 +1344,10 @@ def touch(request):
     # No absolute path specification allowed.
     if posixpath.sep in name:
       raise PopupException(_("Could not name file \"%s\": Slashes are not allowed in filenames." % name))
+
+    # Validate file extension
+    _validate_file_extension_allowed(name)
+
     request.fs.create(
         request.fs.join(
             (path.encode('utf-8') if not isinstance(path, str) else path),
@@ -1566,11 +1571,11 @@ def upload_chunks(request):
     for _ in request.FILES.values():  # This processes the upload.
       pass
   except StopUpload:
-    return JsonResponse({'success': False, 'error': 'Error in upload'})
+    return JsonResponse({"success": False, "error": "Error in upload"})
 
   # case where file is larger than the single chunk size
   if int(request.GET.get("qqtotalparts", 0)) > 0:
-    return JsonResponse({'success': True, 'uuid': request.GET.get('qquuid')})
+    return JsonResponse({"success": True, "uuid": request.GET.get("qquuid")})
 
   # case where file is smaller than the chunk size
   if int(request.GET.get("qqtotalparts", 0)) == 0:
@@ -1578,9 +1583,14 @@ def upload_chunks(request):
     try:
       response = perform_upload_task(request, **chunks)
       return JsonResponse(response)
+    except PopupException as e:
+      logger.error(f"Upload failed: {e}")
+      return JsonResponse({"success": False, "error": str(e)})
     except Exception as e:
-      return JsonResponse({'success': False, 'error': 'Error in upload %s' % str(e)})
-  return JsonResponse({'success': False, 'error': 'Unsupported request method'})
+      # For unexpected exceptions, log the full error but return a generic message
+      logger.exception(f"Unexpected error during upload: {e}")
+      return JsonResponse({"success": False, "error": "Upload failed due to an unexpected error"})
+  return JsonResponse({"success": False, "error": "Unsupported request method"})
 
 
 @require_http_methods(["POST"])
@@ -1596,8 +1606,13 @@ def upload_complete(request):
   try:
     response = perform_upload_task(request, **chunks)
     return JsonResponse(response)
+  except PopupException as e:
+    logger.error(f"Upload failed: {e}")
+    return JsonResponse({"success": False, "error": str(e)})
   except Exception as e:
-    return JsonResponse({'success': False, 'error': 'Error in upload'})
+    # For unexpected exceptions, log the full error but return a generic message
+    logger.exception(f"Unexpected error during upload: {e}")
+    return JsonResponse({"success": False, "error": "Upload failed due to an unexpected error"})
 
 
 @require_http_methods(["POST"])

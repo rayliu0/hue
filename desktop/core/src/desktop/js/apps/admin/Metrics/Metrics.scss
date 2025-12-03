@@ -18,7 +18,7 @@
 
 .metrics-component.antd.cuix {
   background-color: $fluidx-gray-100;
-  padding: 0 24px 24px 24px;
+  padding: 24px;
 
   .metrics-heading {
     font-size: $font-size-base;
@@ -26,30 +26,9 @@
     color: $fluidx-gray-900;
   }
 
-  .metrics-filter {
-    margin: $font-size-sm;
-    width: 30%;
-
-    input {
-      box-shadow: none;
-      -webkit-box-shadow: none;
-    }
-  }
-
-  .metrics-table {
-    th {
-      width: 30%;
-      background-color: $fluidx-gray-040;
-    }
-
-    margin-bottom: $font-size-base;
-  }
-
-  .metrics-select {
-    border: 1px solid $fluidx-gray-600;
-    border-radius: $border-radius-base;
-    background-color: $fluidx-white;
-    min-width: 200px;
-    height: 32px;
+  .metrics-component__table-group {
+    display: flex;
+    flex-direction: column;
+    gap: $font-size-base;
   }
 }

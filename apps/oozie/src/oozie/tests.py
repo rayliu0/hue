@@ -60,10 +60,7 @@ from oozie.utils import workflow_to_dict, model_to_dict, smart_path, contains_sy
 from oozie.importlib.workflows import import_workflow
 from oozie.importlib.jobdesigner import convert_jobsub_design
 
-if sys.version_info[0] > 2:
-  from io import BytesIO as string_io
-else:
-  from cStringIO import StringIO as string_io
+from io import BytesIO as string_io
 
 
 LOG = logging.getLogger()
@@ -956,6 +953,68 @@ class TestEditor(OozieMockBase):
     result = [find_parameters(job, ['name', 'description', 'sla']) for job in jobs]
     assert set(["b", "foo", "food", "time"]) == reduce(lambda x, y: x | set(y), result, set())
 
+
+  def test_get_initial_params_sorting(self):
+    """Test that ParameterForm.get_initial_params() sorts parameters correctly"""
+    from oozie.forms import ParameterForm
+    
+    # Test data with mixed order parameters
+    conf_dict = {
+        'end_date': '2024-01-01T10:00:00Z',
+        'start_date': '2024-01-01T09:00:00Z',
+        'oozie.use.system.libpath': 'true',
+        'custom_param': 'value',
+        'another_param': 'another_value',
+        'nominal_time': '2024-01-01T09:30:00Z'
+    }
+    
+    result = ParameterForm.get_initial_params(conf_dict)
+    
+    # Should be sorted: start_date first, end_date second, then alphabetically
+    assert len(result) == 6, "Expected 6 parameters, got {}".format(len(result))
+    assert result[0]['name'] == 'start_date'
+    assert result[0]['value'] == '2024-01-01T09:00:00Z'
+    assert result[1]['name'] == 'end_date'
+    assert result[1]['value'] == '2024-01-01T10:00:00Z'
+    assert result[2]['name'] == 'another_param'
+    assert result[2]['value'] == 'another_value'
+    assert result[3]['name'] == 'custom_param'
+    assert result[3]['value'] == 'value'
+    assert result[4]['name'] == 'nominal_time'
+    assert result[4]['value'] == '2024-01-01T09:30:00Z'
+    assert result[5]['name'] == 'oozie.use.system.libpath'
+    assert result[5]['value'] == 'true'
+
+  def test_get_initial_params_edge_cases(self):
+    """Test ParameterForm.get_initial_params() with edge cases"""
+    from oozie.forms import ParameterForm
+    
+    # Test empty dict
+    result = ParameterForm.get_initial_params({})
+    assert result == []
+    
+    # Test with oozie parameters (they are included, not filtered out)
+    conf_dict = {
+        'oozie.use.system.libpath': 'true',
+        'oozie.some.other.param': 'value'
+    }
+    result = ParameterForm.get_initial_params(conf_dict)
+    assert len(result) == 2
+    # Should be sorted alphabetically
+    assert result[0]['name'] == 'oozie.some.other.param'
+    assert result[0]['value'] == 'value'
+    assert result[1]['name'] == 'oozie.use.system.libpath'
+    assert result[1]['value'] == 'true'
+    
+    # Test with only start_date and end_date
+    conf_dict = {
+        'end_date': '2024-01-01T10:00:00Z',
+        'start_date': '2024-01-01T09:00:00Z'
+    }
+    result = ParameterForm.get_initial_params(conf_dict)
+    assert len(result) == 2
+    assert result[0]['name'] == 'start_date'
+    assert result[1]['name'] == 'end_date'
 
   def test_find_all_parameters(self):
     self.wf.data = json.dumps({'sla': [
@@ -1958,8 +2017,9 @@ class TestEditor(OozieMockBase):
 
     # Check param popup, SLEEP is set by coordinator so not shown in the popup
     response = self.c.get(reverse('oozie:submit_coordinator', args=[coord.id]))
-    assert ([{'name': u'output', 'value': ''},
-                  {'name': u'market', 'value': u'US'}
+    # Parameters are sorted alphabetically after start_date and end_date
+    assert ([{'name': u'market', 'value': u'US'},
+                  {'name': u'output', 'value': ''}
                   ] ==
                   response.context[0]['params_form'].initial)
 
@@ -3342,23 +3402,6 @@ my_prop_not_filtered=10
     finally:
       finish()
 
-  def test_httppool(self):
-    # With http pool the http connection is reused and so new connection count is 0
-    superuser_client = make_logged_in_client(is_superuser=True)
-    start_log = "--START HTTP POOL TEST--"
-    LOG.warning(start_log)
-    superuser_client.get(reverse('oozie:list_oozie_workflows'))
-    superuser_client.get(reverse('oozie:list_oozie_workflows') + "?format=json")
-    superuser_client.get(reverse('oozie:list_oozie_workflows') + "?format=json&status=RUNNING&status=PREP&status=SUSPENDED")
-    superuser_client.get(reverse('oozie:list_oozie_workflows') + "?format=json&status=KILLED&status=FAILED")
-    end_log = "--END HTTP POOL TEST--"
-    LOG.warning(end_log)
-    response = superuser_client.get(reverse(views.log_view))
-
-    s1 = response._container[0].index(start_log)
-    e1 = response._container[0].index(end_log)
-    c1 = response._container[0][e1:s1].count('Starting new HTTP')
-    assert c1 == 0
 
 class TestDashboard(OozieMockBase):
 

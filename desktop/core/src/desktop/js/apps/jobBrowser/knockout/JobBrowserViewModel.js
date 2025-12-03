@@ -50,13 +50,13 @@ export default class JobBrowserViewModel {
 
     this.availableInterfaces = ko.pureComputed(() => {
       const isDialectEnabled = dialect =>
-        this.appConfig()?.editor?.interpreter_names?.indexOf(dialect) >= 0;
+        this.appConfig()?.editor?.interpreter_names?.includes(dialect);
 
       const historyInterfaceCondition = () => window.ENABLE_HISTORY_V2;
 
       const jobsInterfaceCondition = () =>
         !getLastKnownConfig().has_computes &&
-        this.appConfig()?.browser?.interpreter_names.indexOf('yarn') !== -1 &&
+        this.appConfig()?.browser?.interpreter_names?.includes('yarn') &&
         (!this.cluster() || this.cluster().type.indexOf('altus') === -1);
 
       const dataEngInterfaceCondition = () => this.cluster()?.type === 'altus-de';
@@ -76,19 +76,17 @@ export default class JobBrowserViewModel {
         !this.isMini() && schedulerInterfaceCondition();
 
       const schedulerBeatInterfaceCondition = () =>
-        this.appConfig()?.scheduler?.interpreter_names.indexOf('celery-beat') !== -1;
+        this.appConfig()?.scheduler?.interpreter_names.includes('celery-beat');
 
       const livyInterfaceCondition = () =>
         !this.isMini() &&
-        this.appConfig()?.editor &&
-        (this.appConfig().editor.interpreter_names.indexOf('pyspark') !== -1 ||
-          this.appConfig().editor.interpreter_names.indexOf('sparksql') !== -1);
-
+        (this.appConfig()?.editor?.interpreter_names?.includes('pyspark') ||
+          this.appConfig()?.editor?.interpreter_names?.includes('sparksql'));
       const queryInterfaceCondition = () =>
         window.ENABLE_QUERY_BROWSER &&
         !getLastKnownConfig().has_computes &&
-        this.appConfig()?.editor.interpreter_names.indexOf('impala') !== -1 &&
-        (!this.cluster() || this.cluster().type.indexOf('altus') === -1);
+        this.appConfig()?.editor?.interpreter_names?.includes('impala') &&
+        (!this.cluster()?.type?.includes('altus'));
 
       const queryHiveInterfaceCondition = () => {
         return window.ENABLE_HIVE_QUERY_BROWSER && !getLastKnownConfig().has_computes;

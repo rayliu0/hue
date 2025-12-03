@@ -36,19 +36,30 @@ class TestTrinoApi(TestCase):
     cls.interpreter = {
       'options': {
         'url': 'https://example.com:8080'
-      }
+      },
+      'name': 'trino'
     }
     # Initialize TrinoApi with mock user and interpreter
     cls.trino_api = TrinoApi(cls.user, interpreter=cls.interpreter)
 
   def test_format_identifier(self):
+    # db name test
     test_cases = [
       ("my_db", '"my_db"'),
-      ("my_db.table", '"my_db"."table"'),
+      ("my_catalog.my_db", '"my_catalog"."my_db"'),
     ]
 
     for database, expected_output in test_cases:
-      assert self.trino_api._format_identifier(database) == expected_output
+      assert self.trino_api._format_identifier(database, is_db=True) == expected_output
+
+    # table name test
+    test_cases = [
+      ("io.airlift.discovery.store:name=dynamic,type=distributedstore", '"io.airlift.discovery.store:name=dynamic,type=distributedstore"'),
+      ("table", '"table"'),
+    ]
+
+    for table, expected_output in test_cases:
+      assert self.trino_api._format_identifier(table) == expected_output
 
   def test_parse_api_url(self):
     # Test parse_api_url method
@@ -167,6 +178,7 @@ class TestTrinoApi(TestCase):
 
       expected_result = {
         'row_count': 0,
+        'rows_remaining': 0,
         'next_uri': 'http://url',
         'sync': None,
         'has_result_set': True,
@@ -193,6 +205,7 @@ class TestTrinoApi(TestCase):
 
       expected_result = {
         'row_count': 0,
+        'rows_remaining': 0,
         'next_uri': 'http://url',
         'sync': None,
         'has_result_set': True,
@@ -209,7 +222,7 @@ class TestTrinoApi(TestCase):
       }
       assert result == expected_result
 
-  def test_fetch_result(self):
+  def test_fetch_result_more_than_100(self):
     # Mock TrinoRequest object and its methods
     mock_trino_request = MagicMock()
     self.trino_api.trino_request = mock_trino_request
@@ -218,18 +231,21 @@ class TestTrinoApi(TestCase):
     mock_trino_request.get.return_value = MagicMock()
     _columns = [{'comment': '', 'name': 'test_column1', 'type': 'str'}, {'comment': '', 'name': 'test_column2', 'type': 'str'}]
 
+    # Generate more than 100 rows of mock data
+    mock_data = [[f'value{i}', f'value{i + 1}'] for i in range(1, 201, 1)]
+
     mock_trino_request.process.side_effect = [
       MagicMock(
-        stats={'state': 'FINISHED'}, next_uri='http://url', id=123,
-        rows=[['value1', 'value2'], ['value3', 'value4']], columns=_columns
+        stats={'state': 'FINISHED'}, next_uri='http://url1', id=123,
+        rows=mock_data[:57], columns=_columns
       ),
       MagicMock(
-        stats={'state': 'FINISHED'}, next_uri='http://url1', id=124,
-        rows=[['value5', 'value6'], ['value7', 'value8']], columns=_columns
+        stats={'state': 'FINISHED'}, next_uri='http://url2', id=124,
+        rows=mock_data[57:105], columns=_columns
       ),
       MagicMock(
         stats={'state': 'FINISHED'}, next_uri=None, id=125,
-        rows=[['value9', 'value10'], ['value11', 'value12']], columns=_columns
+        rows=mock_data[105:], columns=_columns
       )
     ]
 
@@ -239,13 +255,11 @@ class TestTrinoApi(TestCase):
     )
 
     expected_result = {
-      'row_count': 94,
-      'next_uri': None,
-      'has_more': False,
-      'data': [
-        ['value1', 'value2'], ['value3', 'value4'], ['value5', 'value6'],
-        ['value7', 'value8'], ['value9', 'value10'], ['value11', 'value12']
-      ],
+      'row_count': 100,
+      'rows_remaining': 5,
+      'next_uri': 'http://url1',
+      'has_more': True,
+      'data': mock_data[:100],
       'meta': [{
         'name': column['name'],
         'type': column['type'],
@@ -255,7 +269,53 @@ class TestTrinoApi(TestCase):
     }
 
     assert result == expected_result
-    assert len(result['data']) == 6
+    assert len(result['data']) == 100
+    assert len(result['meta']) == 2
+
+  def test_fetch_result_less_than_100(self):
+    # Mock TrinoRequest object and its methods
+    mock_trino_request = MagicMock()
+    self.trino_api.trino_request = mock_trino_request
+
+    # Configure the MagicMock object to return expected responses
+    mock_trino_request.get.return_value = MagicMock()
+    _columns = [{'comment': '', 'name': 'test_column1', 'type': 'str'}, {'comment': '', 'name': 'test_column2', 'type': 'str'}]
+
+    # Generate 100 rows of mock data
+    mock_data = [[f'value{i}', f'value{i + 1}'] for i in range(1, 90, 1)]
+
+    mock_trino_request.process.side_effect = [
+      MagicMock(
+        stats={'state': 'FINISHED'}, next_uri='http://url1', id=123,
+        rows=mock_data[:57], columns=_columns
+      ),
+      MagicMock(
+        stats={'state': 'FINISHED'}, next_uri=None, id=124,
+        rows=mock_data[57:], columns=_columns
+      )
+    ]
+
+    # Call the fetch_result method
+    result = self.trino_api.fetch_result(
+      notebook={}, snippet={'result': {'handle': {'next_uri': 'http://url', 'result': {'data': []}}}}, rows=0, start_over=False
+    )
+
+    expected_result = {
+      'row_count': 89,
+      'rows_remaining': 0,
+      'next_uri': None,
+      'has_more': False,
+      'data': mock_data[:90],
+      'meta': [{
+        'name': column['name'],
+        'type': column['type'],
+        'comment': ''
+        } for column in _columns],
+      'type': 'table'
+    }
+
+    assert result == expected_result
+    assert len(result['data']) == 89
     assert len(result['meta']) == 2
 
   def test_get_select_query(self):
@@ -348,9 +408,49 @@ class TestTrinoApi(TestCase):
       'options': {
         'url': 'https://example.com:8080',
         'auth_password_script': 'custom_script'
-      }
+      },
+      'name': 'trino'
     }
 
     with patch('notebook.connectors.trino.coerce_password_from_script', return_value='custom_password_script'):
       trino_api = TrinoApi(self.user, interpreter=interpreter)
       assert trino_api.auth_password == 'custom_password_script'
+
+  def test_get_log(self):
+    notebook = {}
+    snippet = {
+      'result': {
+        'handle': {
+          'guid': '1234-abcd-5678-efgh'
+        }
+      }
+    }
+
+    # Expected result
+    expected_log = "query_id: 1234-abcd-5678-efgh"
+    result = self.trino_api.get_log(notebook, snippet)
+
+    assert result == expected_log
+
+  def test_show_databases(self):
+    with patch('notebook.connectors.trino.LOG.error') as Log_error:
+      with patch('notebook.connectors.trino.TrinoQuery') as TrinoQuery:
+        with patch('notebook.connectors.trino.TrinoApi._show_catalogs') as _show_catalogs:
+          _show_catalogs.return_value = [
+            'catalog1', 'catalog2'
+          ]
+          query_instance = TrinoQuery.return_value
+          query_instance.execute.side_effect = [
+            MagicMock(rows=[["schema1"], ["schema2"]]),  # First catalog response
+            Exception("Some error")  # Second catalog raises an exception
+          ]
+          result = self.trino_api._show_databases()
+
+          # Assert the expected output
+          expected_result = ['catalog1.schema1', 'catalog1.schema2']
+          self.assertEqual(result, expected_result)
+
+          # Assert error logging was called for the exception
+          Log_error.assert_called_once_with(
+            "Failed to fetch schemas from catalog catalog2: Some error"
+          )

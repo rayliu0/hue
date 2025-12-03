@@ -15,29 +15,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from builtins import object
 import logging
-import sys
+from builtins import object
 
-from desktop.lib.exceptions_renderable import PopupException
+from django.utils.translation import gettext as _
+
 from desktop.lib.i18n import force_unicode
 from indexer.solr_client import SolrClient
-
 from notebook.connectors.base import Api, QueryError
 from notebook.models import escape_rows
-
-if sys.version_info[0] > 2:
-  from django.utils.translation import gettext as _
-else:
-  from django.utils.translation import ugettext as _
-
 
 LOG = logging.getLogger()
 
 
 try:
   from libsolr.api import SolrApi as NativeSolrApi
-except (ImportError, AttributeError) as e:
+except (ImportError, AttributeError):
   LOG.exception('Search is not enabled')
 
 
@@ -71,7 +64,7 @@ class SolrApi(Api):
 
     response = api.sql(collection, snippet['statement'])
 
-    info = response['result-set']['docs'].pop(-1) # EOF, RESPONSE_TIME, EXCEPTION
+    info = response['result-set']['docs'].pop(-1)  # EOF, RESPONSE_TIME, EXCEPTION
     if info.get('EXCEPTION'):
       raise QueryError(info['EXCEPTION'])
 
@@ -103,11 +96,9 @@ class SolrApi(Api):
       'statements_count': 1
     }
 
-
   @query_error_handler
   def check_status(self, notebook, snippet):
     return {'status': 'available'}
-
 
   @query_error_handler
   def fetch_result(self, notebook, snippet, rows, start_over):
@@ -118,16 +109,13 @@ class SolrApi(Api):
       'type': 'table'
     }
 
-
   @query_error_handler
   def fetch_result_metadata(self):
     pass
 
-
   @query_error_handler
   def cancel(self, notebook, snippet):
     return {'status': 0}
-
 
   @query_error_handler
   def get_log(self, notebook, snippet, startFrom=None, size=None):
@@ -136,7 +124,6 @@ class SolrApi(Api):
   @query_error_handler
   def close_statement(self, notebook, snippet):
     return {'status': -1}
-
 
   @query_error_handler
   def autocomplete(self, snippet, database=None, table=None, column=None, nested=None, operation=None):
@@ -157,9 +144,8 @@ class SolrApi(Api):
     response['status'] = 0
     return response
 
-
   @query_error_handler
-  def get_sample_data(self, snippet, database=None, table=None, column=None, is_async=False, operation=None):
+  def get_sample_data(self, snippet, database=None, table=None, column=None, nested=None, is_async=False, operation=None):
     from search.conf import SOLR_URL
     db = NativeSolrApi(SOLR_URL.get(), self.user)
 
@@ -169,7 +155,7 @@ class SolrApi(Api):
     if snippet.get('source') == 'sql':
       sample_data = assist.get_sample_data_sql(database, table, column)
     else:
-      sample_data = assist.get_sample_data(database, table, column)
+      sample_data = assist.get_sample_data(database, table, column, nested)
 
     if sample_data:
       response['status'] = 0
@@ -203,9 +189,15 @@ class Assist(object):
     ]
 
   def get_columns(self, database, table):
-    return [{'name': field['name'], 'type': field['type'], 'comment': '', 'primary_key': field.get('primary_key')} for field in self.db.schema_fields(table)['fields']]
+    return [{
+      'name': field['name'],
+      'type': field['type'],
+      'comment': '',
+      'primary_key': field.get('primary_key')
+      } for field in self.db.schema_fields(table)['fields']
+    ]
 
-  def get_sample_data(self, database, table, column=None):
+  def get_sample_data(self, database, table, column=None, nested=None):
     # Note: currently ignores dynamic fields
     full_headers = self.get_columns(database, table)
     headers = [col['name'] for col in full_headers]

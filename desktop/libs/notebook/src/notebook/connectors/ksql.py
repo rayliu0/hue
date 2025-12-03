@@ -18,27 +18,19 @@
 
 from __future__ import absolute_import
 
-import logging
 import json
-import sys
+import logging
 
-from desktop.lib.i18n import force_unicode
 from desktop.conf import has_channels
+from desktop.lib.i18n import force_unicode
 from kafka.ksql_client import KSqlApi as KSqlClientApi
-
 from notebook.connectors.base import Api, QueryError
-
-if sys.version_info[0] > 2:
-  from django.utils.translation import gettext as _
-else:
-  from django.utils.translation import ugettext as _
-
 
 LOG = logging.getLogger()
 
 
 if has_channels():
-  from notebook.consumer import _send_to_channel
+  pass
 
 
 def query_error_handler(func):
@@ -60,10 +52,8 @@ class KSqlApi(Api):
 
     self.url = self.options['url']
 
-
   def _get_db(self):
     return KSqlClientApi(user=self.user, url=self.url)
-
 
   @query_error_handler
   def execute(self, notebook, snippet):
@@ -94,11 +84,9 @@ class KSqlApi(Api):
       }
     }
 
-
   @query_error_handler
   def check_status(self, notebook, snippet):
     return {'status': 'available'}
-
 
   @query_error_handler
   def autocomplete(self, snippet, database=None, table=None, column=None, nested=None, operation=None):
@@ -135,7 +123,7 @@ class KSqlApi(Api):
     return response
 
   @query_error_handler
-  def get_sample_data(self, snippet, database=None, table=None, column=None, is_async=False, operation=None):
+  def get_sample_data(self, snippet, database=None, table=None, column=None, nested=None, is_async=False, operation=None):
     notebook = {}
 
     snippet = {

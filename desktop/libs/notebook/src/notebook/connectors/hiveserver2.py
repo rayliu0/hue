@@ -15,13 +15,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
-import sys
-import copy
-import json
-import struct
-import logging
 import binascii
+import copy
+import importlib.util
+import json
+import logging
+import re
 from builtins import next, object
 from urllib.parse import quote as urllib_quote, unquote as urllib_unquote
 
@@ -30,7 +29,7 @@ from django.utils.translation import gettext as _
 
 from beeswax.common import is_compute
 from desktop.auth.backend import is_admin
-from desktop.conf import USE_DEFAULT_CONFIGURATION, has_connectors
+from desktop.conf import has_connectors, USE_DEFAULT_CONFIGURATION
 from desktop.lib.conf import BoundConfig
 from desktop.lib.exceptions import StructuredException
 from desktop.lib.exceptions_renderable import PopupException
@@ -40,47 +39,45 @@ from desktop.lib.rest.http_client import RestException
 from desktop.lib.thrift_util import unpack_guid, unpack_guid_base64
 from desktop.models import DefaultConfiguration, Document2
 from notebook.connectors.base import (
+  _get_snippet_name,
   Api,
+  get_interpreter,
   Notebook,
   OperationNotSupported,
   OperationTimeout,
+  patch_snippet_for_connector,
   QueryError,
   QueryExpired,
-  _get_snippet_name,
-  get_interpreter,
-  patch_snippet_for_connector,
 )
 
 LOG = logging.getLogger()
 
 
 try:
-  from beeswax import conf as beeswax_conf, data_export
   from beeswax.api import _autocomplete, _get_sample_data
   from beeswax.conf import (
     CLOSE_SESSIONS,
     CONFIG_WHITELIST as hive_settings,
     DOWNLOAD_BYTES_LIMIT,
     DOWNLOAD_ROW_LIMIT,
-    MAX_NUMBER_OF_SESSIONS,
     has_multiple_sessions,
     has_session_pool,
+    MAX_NUMBER_OF_SESSIONS,
   )
   from beeswax.data_export import upload
   from beeswax.design import hql_query
-  from beeswax.models import QUERY_TYPES, HiveServerQueryHandle, HiveServerQueryHistory, QueryHistory, Session
+  from beeswax.models import HiveServerQueryHandle, HiveServerQueryHistory, QUERY_TYPES, QueryHistory, Session
   from beeswax.server import dbms
-  from beeswax.server.dbms import QueryServerException, get_query_server_config, reset_ha
+  from beeswax.server.dbms import get_query_server_config, QueryServerException, reset_ha
   from beeswax.views import parse_out_jobs, parse_out_queries
 except ImportError as e:
   LOG.warning('Hive and HiveServer2 interfaces are not enabled: %s' % e)
   hive_settings = None
 
-try:
-  from impala import api  # Force checking if Impala is enabled
+if importlib.util.find_spec('impala.api') is not None:
   from impala.conf import CONFIG_WHITELIST as impala_settings
-  from impala.server import ImpalaDaemonApiException, _get_impala_server_url, get_api as get_impalad_api
-except ImportError as e:
+  from impala.server import _get_impala_server_url, get_api as get_impalad_api, ImpalaDaemonApiException
+else:
   LOG.warning("Impala app is not enabled")
   impala_settings = None
 
@@ -91,7 +88,7 @@ try:
   has_query_browser = ENABLE_QUERY_BROWSER.get()
   has_hive_query_browser = ENABLE_HIVE_QUERY_BROWSER.get()
   has_jobbrowser = True
-except (AttributeError, ImportError, RuntimeError) as e:
+except (AttributeError, ImportError, RuntimeError):
   LOG.warning("Job Browser app is not enabled")
   has_jobbrowser = False
   has_query_browser = False
@@ -115,7 +112,7 @@ def query_error_handler(func):
         raise QueryError(message)
     except QueryServerException as e:
       message = force_unicode(str(e))
-      if 'Invalid query handle' in message or 'Invalid OperationHandle' in message:
+      if 'Invalid query handle' in message or 'Invalid OperationHandle' in message or 'Invalid or unknown query handle' in message:
         raise QueryExpired(e)
       else:
         raise QueryError(message)
@@ -123,11 +120,11 @@ def query_error_handler(func):
 
 
 def is_hive_enabled():
-  return hive_settings is not None and type(hive_settings) == BoundConfig
+  return hive_settings is not None and isinstance(hive_settings, BoundConfig)
 
 
 def is_impala_enabled():
-  return impala_settings is not None and type(impala_settings) == BoundConfig
+  return impala_settings is not None and isinstance(impala_settings, BoundConfig)
 
 
 class HiveConfiguration(object):
@@ -260,10 +257,11 @@ class HS2Api(Api):
 
     if not session_id:
       session = Session.objects.get_session(self.user, application=app_name)
-      decoded_guid = session.get_handle().sessionId.guid
-      session_decoded_id = unpack_guid(decoded_guid)
-      if source_method == "dt_logout":
-        LOG.debug("Closing Impala session id %s on logout for user %s" % (session_decoded_id, self.user.username))
+      if session:
+        decoded_guid = session.get_handle().sessionId.guid
+        session_decoded_id = unpack_guid(decoded_guid)
+        if source_method == "dt_logout":
+          LOG.debug("Closing Impala session id %s on logout for user %s" % (session_decoded_id, self.user.username))
 
     query_server = get_query_server_config(name=app_name)
 
@@ -340,9 +338,9 @@ class HS2Api(Api):
 
     # All good
     server_id, server_guid = handle.get()
-    if sys.version_info[0] > 2:
-      server_id = server_id.decode('utf-8')
-      server_guid = server_guid.decode('utf-8')
+
+    server_id = server_id.decode('utf-8')
+    server_guid = server_guid.decode('utf-8')
 
     response = {
       'secret': server_id,
@@ -394,7 +392,7 @@ class HS2Api(Api):
     try:
       results = db.fetch(handle, start_over=start_over, rows=rows)
     except QueryServerException as ex:
-      if re.search('(client inactivity)|(Invalid query handle)', str(ex)) and ex.message:
+      if re.search('(client inactivity)|(Invalid query handle)|(Invalid or unknown query handle)', str(ex)) and ex.message:
         raise QueryExpired(message=ex.message)
       else:
         raise QueryError(ex)
@@ -707,7 +705,7 @@ DROP TABLE IF EXISTS `%(table)s`;
         filters = {'id': session_id, 'application': 'beeswax' if type == 'hive' or type == 'llap' else type}
         if not is_admin(self.user):
           filters['owner'] = self.user
-        return Session.objects.get(**filters)
+        return Session.objects.filter(**filters).first()
 
   def _get_hive_execution_engine(self, notebook, snippet):
     # Get hive.execution.engine from snippet properties, if none, then get from session
@@ -782,7 +780,8 @@ DROP TABLE IF EXISTS `%(table)s`;
       LOG.warning('Handle already base 64 decoded')
 
     for key in list(handle.keys()):
-      if key not in ('log_context', 'secret', 'has_result_set', 'operation_type', 'modified_row_count', 'guid'):
+      if key not in ('log_context', 'secret', 'has_result_set', 'operation_type',
+                     'modified_row_count', 'guid', 'session_id', 'session_guid'):
         handle.pop(key)
 
     return HiveServerQueryHandle(**handle)
@@ -927,6 +926,14 @@ DROP TABLE IF EXISTS `%(table)s`;
 
   def describe_column(self, notebook, snippet, database=None, table=None, column=None):
     db = self._get_db(snippet, interpreter=self.interpreter)
+    tb = db.get_table(database, table)
+
+    # Column stats are not available for views in both Hive and Impala
+    if tb.is_view:
+      msg = f'Cannot describe column for view: {table}'
+      LOG.debug(msg)
+      return {'message': msg}
+
     return db.get_table_columns_stats(database, table, column)
 
   def describe_table(self, notebook, snippet, database=None, table=None):
